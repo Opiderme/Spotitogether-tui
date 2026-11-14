@@ -114,6 +114,15 @@ impl Room {
                 }
                 None => vec![error(from, ErrorCode::NotFound, "élément absent de la file")],
             },
+            ClientMsg::QueueMove { id, index } => match self.queue.iter().position(|i| i.id == id) {
+                Some(from) => {
+                    let item = self.queue.remove(from).expect("index from position");
+                    let to = index.min(self.queue.len());
+                    self.queue.insert(to, item);
+                    if from == to { vec![] } else { vec![self.queue_msg()] }
+                }
+                None => vec![error(from, ErrorCode::NotFound, "élément absent de la file")],
+            },
             ClientMsg::Play => {
                 if self.playback.current.is_none() {
                     return if self.queue.is_empty() { vec![] } else { self.advance(now_ms) };
@@ -276,6 +285,21 @@ mod tests {
         let p = playback(&r.handle(a, ClientMsg::Seek { position_ms: 99_999 }, 9_000)).unwrap().clone();
         assert_eq!(p.position_ms, 10_000);
         assert!(p.seq > 3);
+    }
+
+    #[test]
+    fn moves_queue_items() {
+        let (mut r, a) = room();
+        for n in 1..=4 {
+            r.handle(a, ClientMsg::QueueAdd { track: track(n, 1000) }, 0);
+        }
+        // T1 is playing; queue = T2 T3 T4 (ids 2, 3, 4).
+        let names = |r: &Room| r.snapshot().queue.iter().map(|i| i.track.name.clone()).collect::<Vec<_>>();
+        r.handle(a, ClientMsg::QueueMove { id: 4, index: 0 }, 0);
+        assert_eq!(names(&r), ["T4", "T2", "T3"]);
+        r.handle(a, ClientMsg::QueueMove { id: 4, index: 99 }, 0);
+        assert_eq!(names(&r), ["T2", "T3", "T4"]);
+        assert!(r.handle(a, ClientMsg::QueueMove { id: 3, index: 1 }, 0).is_empty());
     }
 
     #[test]

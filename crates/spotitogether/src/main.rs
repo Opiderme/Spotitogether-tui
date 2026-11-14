@@ -58,6 +58,9 @@ enum Command {
         /// Rejoindre sans rien jouer sur ton compte Spotify
         #[arg(long)]
         spectator: bool,
+        /// Interface en lignes de commande au lieu de la TUI plein écran
+        #[arg(long)]
+        plain: bool,
     },
     /// Commandes Spotify directes, pour tester ton installation
     #[command(subcommand)]
@@ -67,9 +70,7 @@ enum Command {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    // The server logs joins/leaves; other commands only warnings.
-    let level = if matches!(cli.command, Command::Serve { .. }) { tracing::Level::INFO } else { tracing::Level::WARN };
-    tracing_subscriber::fmt().with_max_level(level).with_writer(io::stderr).with_target(false).init();
+    init_logging(&cli.command);
 
     if let Err(err) = run(cli).await {
         eprintln!("Erreur : {err:#}");
@@ -87,10 +88,34 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Serve { port, bind, code } => room_cmd::serve(port, bind, code).await,
-        Command::Join { invite, code, name, host_token, spectator } => {
-            room_cmd::join(room_cmd::JoinArgs { invite, code, name, host_token, spectator }).await
+        Command::Join { invite, code, name, host_token, spectator, plain } => {
+            room_cmd::join(room_cmd::JoinArgs { invite, code, name, host_token, spectator, plain }).await
         }
         Command::Spotify(cmd) => spotify_cmd::run(cmd).await,
+    }
+}
+
+/// The server logs joins/leaves to stderr; the TUI owns the screen, so it
+/// logs to `~/.cache/spotitogether/spotitogether.log` instead.
+fn init_logging(command: &Command) {
+    let builder = tracing_subscriber::fmt().with_target(false);
+    match command {
+        Command::Serve { .. } => builder.with_max_level(tracing::Level::INFO).with_writer(io::stderr).init(),
+        Command::Join { plain: false, .. } => {
+            let file = config::project_dirs().ok().and_then(|d| {
+                std::fs::create_dir_all(d.cache_dir()).ok()?;
+                std::fs::OpenOptions::new().create(true).append(true).open(d.cache_dir().join("spotitogether.log")).ok()
+            });
+            match file {
+                Some(f) => builder
+                    .with_max_level(tracing::Level::WARN)
+                    .with_ansi(false)
+                    .with_writer(std::sync::Mutex::new(f))
+                    .init(),
+                None => builder.with_max_level(tracing::Level::ERROR).with_writer(io::sink).init(),
+            }
+        }
+        _ => builder.with_max_level(tracing::Level::WARN).with_writer(io::stderr).init(),
     }
 }
 

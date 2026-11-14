@@ -80,18 +80,49 @@ pub struct JoinOptions {
 pub enum Event {
     Server(Box<ServerMsg>),
     Sync(SyncEvent),
+    /// New clock estimate: server time = local time + `offset_ms`.
+    Clock { offset_ms: i64, rtt_ms: u64 },
     Disconnected(String),
+}
+
+enum Command {
+    Send(ClientMsg),
+    /// Re-apply the room state on Spotify now.
+    Resync,
 }
 
 /// Sends commands to the room.
 #[derive(Clone)]
 pub struct RoomHandle {
-    tx: mpsc::UnboundedSender<ClientMsg>,
+    tx: mpsc::UnboundedSender<Command>,
 }
 
 impl RoomHandle {
     pub fn send(&self, msg: ClientMsg) -> bool {
-        self.tx.send(msg).is_ok()
+        self.tx.send(Command::Send(msg)).is_ok()
+    }
+
+    /// Handle connected to nothing (tests, previews): messages are dropped.
+    pub fn detached() -> Self {
+        let (tx, _) = mpsc::unbounded_channel();
+        Self { tx }
+    }
+
+    /// Forces the local Spotify back onto the room state.
+    pub fn resync(&self) -> bool {
+        self.tx.send(Command::Resync).is_ok()
+    }
+}
+
+/// Room metadata for a Spotify track (sent by whoever queues it).
+pub fn track_info(t: &spotify::models::Track) -> protocol::TrackInfo {
+    protocol::TrackInfo {
+        uri: t.uri.clone(),
+        name: t.name.clone(),
+        artists: t.artist_names(),
+        duration_ms: t.duration_ms,
+        album_uri: Some(t.album.uri.clone()).filter(|u| !u.is_empty()),
+        cover_url: t.cover_url().map(str::to_owned),
     }
 }
 
@@ -132,7 +163,7 @@ type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<t
 
 async fn run(
     mut ws: Ws,
-    mut commands: mpsc::UnboundedReceiver<ClientMsg>,
+    mut commands: mpsc::UnboundedReceiver<Command>,
     events: mpsc::UnboundedSender<Event>,
     mut playback: Playback,
     spotify: Option<Arc<SpotifyClient>>,
@@ -171,6 +202,7 @@ async fn run(
                 match &msg {
                     ServerMsg::Pong { t0, server_ms } => {
                         clock.record(*t0, *server_ms, local_ms());
+                        emit(Event::Clock { offset_ms: clock.offset_ms(), rtt_ms: clock.rtt_ms().unwrap_or(0) });
                         continue;
                     }
                     ServerMsg::Playback(p) if p.seq > playback.seq => {
@@ -183,10 +215,11 @@ async fn run(
                 emit(Event::Server(Box::new(msg)));
             }
             cmd = commands.recv() => match cmd {
-                Some(cmd) => {
-                    let json = serde_json::to_string(&cmd).expect("serializable");
+                Some(Command::Send(msg)) => {
+                    let json = serde_json::to_string(&msg).expect("serializable");
                     if let Err(e) = ws.send(Message::text(json)).await { break e.to_string(); }
                 }
+                Some(Command::Resync) => pending_apply = spotify.is_some(),
                 None => {
                     let _ = ws.close(None).await;
                     return;

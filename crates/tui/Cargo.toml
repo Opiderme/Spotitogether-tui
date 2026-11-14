@@ -5,3 +5,18 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow = "1.0.104"
+client = { version = "0.1.0", path = "../client" }
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+directories = "6.0.0"
+futures-util = "0.3.34"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+notify = "8.2.2"
+protocol = { version = "0.1.0", path = "../protocol" }
+ratatui = "0.30.2"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+spotify = { version = "0.1.0", path = "../spotify" }
+tokio = { version = "1.54.1", features = ["full"] }
+tracing = "0.1.44"

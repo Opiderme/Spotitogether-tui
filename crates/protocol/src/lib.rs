@@ -33,6 +33,8 @@ pub enum ClientMsg {
     Ping { t0: u64 },
     QueueAdd { track: TrackInfo },
     QueueRemove { id: ItemId },
+    /// Moves an item to `index` (0 = next to play).
+    QueueMove { id: ItemId, index: usize },
     Play,
     Pause,
     Seek { position_ms: u64 },

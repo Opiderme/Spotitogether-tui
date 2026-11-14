@@ -10,8 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use client::{Event, JoinOptions, SyncEvent, parse_invite};
-use protocol::{ClientMsg, Member, Playback, QueueItem, Role, ServerMsg, TrackInfo};
-use spotify::models::Track;
+use protocol::{ClientMsg, Member, Playback, QueueItem, Role, ServerMsg};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
 
@@ -88,6 +87,7 @@ pub struct JoinArgs {
     pub name: Option<String>,
     pub host_token: Option<String>,
     pub spectator: bool,
+    pub plain: bool,
 }
 
 #[derive(Default)]
@@ -127,6 +127,13 @@ pub async fn join(args: JoinArgs) -> Result<()> {
         spotify.clone(),
     )
     .await?;
+
+    if !args.plain {
+        return match tui::run(joined, spotify).await? {
+            Some(reason) => bail!("déconnecté du salon : {reason}"),
+            None => Ok(()),
+        };
+    }
 
     let mut view = View {
         playback: Some(joined.room.playback.clone()),
@@ -196,7 +203,7 @@ async fn run_command(
             let sp = spotify.context("la recherche nécessite un compte Spotify (pas en mode spectateur)")?;
             let track = resolve_track(sp, arg).await?;
             println!("+ {} — {}", track.name, track.artist_names());
-            ClientMsg::QueueAdd { track: track_info(&track) }
+            ClientMsg::QueueAdd { track: client::track_info(&track) }
         }
         "rm" => {
             let n: usize = arg.parse().context("/rm <numéro dans /queue>")?;
@@ -228,22 +235,11 @@ async fn run_command(
     Ok(false)
 }
 
-fn track_info(t: &Track) -> TrackInfo {
-    TrackInfo {
-        uri: t.uri.clone(),
-        name: t.name.clone(),
-        artists: t.artist_names(),
-        duration_ms: t.duration_ms,
-        album_uri: Some(t.album.uri.clone()).filter(|u| !u.is_empty()),
-        cover_url: t.cover_url().map(str::to_owned),
-    }
-}
-
 fn show_event(event: Event, view: &mut View) {
     match event {
         Event::Server(msg) => show_server_msg(*msg, view),
         Event::Sync(e) => show_sync_event(e),
-        Event::Disconnected(_) => {}
+        Event::Clock { .. } | Event::Disconnected(_) => {}
     }
 }
 
