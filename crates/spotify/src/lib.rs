@@ -10,5 +10,5 @@ mod error;
 pub mod models;
 
 pub use auth::Token;
-pub use client::{SpotifyClient, TokenSink};
+pub use client::{Method, SpotifyClient, TokenSink};
 pub use error::{Error, Result};

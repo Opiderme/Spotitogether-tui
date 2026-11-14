@@ -1,8 +1,10 @@
 mod config;
+mod room_cmd;
 mod secrets;
 mod spotify_cmd;
 
 use std::io::{self, BufRead, Write};
+use std::net::IpAddr;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -28,6 +30,35 @@ enum Command {
     Login,
     /// Supprime le jeton Spotify enregistré
     Logout,
+    /// Héberge un salon sur cette machine
+    Serve {
+        /// Port d'écoute
+        #[arg(long, short, default_value_t = protocol::DEFAULT_PORT)]
+        port: u16,
+        /// Adresse d'écoute (0.0.0.0 = tout le réseau local)
+        #[arg(long, default_value = "0.0.0.0")]
+        bind: IpAddr,
+        /// Code d'invitation choisi (sinon généré au hasard)
+        #[arg(long)]
+        code: Option<String>,
+    },
+    /// Rejoint un salon : spotitogether join spotitogether://hôte:port/CODE
+    Join {
+        /// Lien d'invitation (spotitogether://hôte:port/CODE, hôte:port/CODE ou ws://…)
+        invite: String,
+        /// Code du salon, s'il n'est pas dans le lien
+        #[arg(long)]
+        code: Option<String>,
+        /// Pseudo affiché (par défaut ton nom Spotify)
+        #[arg(long)]
+        name: Option<String>,
+        /// Jeton d'hôte affiché par `serve` (automatique sur la même machine)
+        #[arg(long)]
+        host_token: Option<String>,
+        /// Rejoindre sans rien jouer sur ton compte Spotify
+        #[arg(long)]
+        spectator: bool,
+    },
     /// Commandes Spotify directes, pour tester ton installation
     #[command(subcommand)]
     Spotify(spotify_cmd::SpotifyCmd),
@@ -35,13 +66,12 @@ enum Command {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN)
-        .with_writer(io::stderr)
-        .with_target(false)
-        .init();
+    let cli = Cli::parse();
+    // The server logs joins/leaves; other commands only warnings.
+    let level = if matches!(cli.command, Command::Serve { .. }) { tracing::Level::INFO } else { tracing::Level::WARN };
+    tracing_subscriber::fmt().with_max_level(level).with_writer(io::stderr).with_target(false).init();
 
-    if let Err(err) = run(Cli::parse()).await {
+    if let Err(err) = run(cli).await {
         eprintln!("Erreur : {err:#}");
         std::process::exit(1);
     }
@@ -55,6 +85,10 @@ async fn run(cli: Cli) -> Result<()> {
             secrets::delete()?;
             println!("Jeton Spotify supprimé.");
             Ok(())
+        }
+        Command::Serve { port, bind, code } => room_cmd::serve(port, bind, code).await,
+        Command::Join { invite, code, name, host_token, spectator } => {
+            room_cmd::join(room_cmd::JoinArgs { invite, code, name, host_token, spectator }).await
         }
         Command::Spotify(cmd) => spotify_cmd::run(cmd).await,
     }

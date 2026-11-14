@@ -4,8 +4,8 @@
 sur sa machine, les autres le rejoignent avec un code, et chacun entend la même
 musique sur son propre compte Spotify.
 
-> État : phase 1 (connexion Spotify et commandes de test). Salons, synchro et
-> interface TUI arrivent dans les phases suivantes.
+> État : phase 2 (salon et synchro, client en ligne de commande). L'interface
+> TUI plein écran arrive en phase 3, les permissions en phase 4.
 
 ## Prérequis
 
@@ -29,6 +29,23 @@ spotitogether spotify play daft punk one more time
 spotitogether spotify status
 ```
 
+## Héberger et rejoindre un salon
+
+```sh
+# Terminal 1 : l'hôte lance le salon
+spotitogether serve                 # affiche le code et le lien d'invitation
+
+# Terminal 2 : l'hôte rejoint son propre salon (rôle d'hôte automatique)
+spotitogether join spotitogether://127.0.0.1:7420/K7XQ2M
+
+# Chez un ami
+spotitogether join spotitogether://192.168.1.19:7420/K7XQ2M
+```
+
+Dans le salon, tape un titre pour l'ajouter à la file, ou `/help` pour les
+commandes (`/queue`, `/skip`, `/pause`, `/seek 1:30`…). Chacun entend la musique
+sur son propre compte ; une dérive de plus de 1,5 s est corrigée automatiquement.
+
 Chaque utilisateur crée sa propre app sur le
 [dashboard Spotify](https://developer.spotify.com/dashboard) : depuis février 2026,
 une app en mode développement est limitée à 5 utilisateurs. Redirect URI à
@@ -43,4 +60,7 @@ KWallet…), ou à défaut dans `~/.local/share/spotitogether/token.json` (droit
 | --- | --- |
 | `spotify` | OAuth PKCE et client de l'API Web Spotify |
 | `spotitogether` | Binaire et sous-commandes |
-| `protocol`, `server`, `client`, `tui` | Phases 2 à 4 |
+| `protocol` | Messages JSON échangés en WebSocket |
+| `server` | Salon : file, minuteur de piste, diffusion de l'état |
+| `client` | Connexion au salon, horloge, synchro du Spotify local |
+| `tui` | Phase 3 |

@@ -42,6 +42,8 @@ pub struct Image {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Album {
     #[serde(default)]
+    pub uri: String,
+    #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub images: Vec<Image>,
@@ -93,6 +95,14 @@ pub struct PlaybackState {
     pub item: Option<Track>,
 }
 
+/// First controllable device, preferring a computer over phones/speakers.
+/// Used when no device is active: Spotify would otherwise answer
+/// NO_ACTIVE_DEVICE.
+pub fn pick_idle_device(devices: &[Device]) -> Option<&Device> {
+    let usable = || devices.iter().filter(|d| d.id.is_some() && !d.is_restricted);
+    usable().find(|d| d.kind == "Computer").or_else(|| usable().next())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct DevicesResponse {
     pub devices: Vec<Device>,
@@ -110,4 +120,29 @@ pub struct Paging<T> {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct SearchResponse {
     pub tracks: Paging<Track>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dev(name: &str, kind: &str, restricted: bool) -> Device {
+        Device {
+            id: Some(name.to_owned()),
+            name: name.to_owned(),
+            kind: kind.to_owned(),
+            is_active: false,
+            is_restricted: restricted,
+            volume_percent: None,
+        }
+    }
+
+    #[test]
+    fn picks_computer_then_any_controllable_device() {
+        let devices = [dev("tel", "Smartphone", false), dev("pc", "Computer", false)];
+        assert_eq!(pick_idle_device(&devices).unwrap().name, "pc");
+        let devices = [dev("enceinte", "Speaker", true), dev("tel", "Smartphone", false)];
+        assert_eq!(pick_idle_device(&devices).unwrap().name, "tel");
+        assert!(pick_idle_device(&[dev("x", "Speaker", true)]).is_none());
+    }
 }

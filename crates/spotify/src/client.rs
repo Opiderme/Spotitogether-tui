@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use reqwest::header::{CONTENT_LENGTH, RETRY_AFTER};
-use reqwest::{Method, Response, StatusCode};
+pub use reqwest::Method;
+use reqwest::{Response, StatusCode};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -91,9 +92,20 @@ impl SpotifyClient {
         Ok(Some(serde_json::from_str(&body)?))
     }
 
-    /// Starts `uris` at `position_ms` on `device_id` (or the active device).
-    pub async fn play(&self, device_id: Option<&str>, uris: &[String], position_ms: u64) -> Result<()> {
-        let body = json!({ "uris": uris, "position_ms": position_ms });
+    /// Starts `track_uri` at `position_ms` on `device_id` (or the active device).
+    ///
+    /// With `album_uri` the track is started inside its album context
+    /// (`context_uri` + `offset`). As of November 2026 the desktop client
+    /// ignores the `uris` form and restarts the previous track at 0:00, while
+    /// the album form works; `uris` is only the fallback.
+    pub async fn play_track(
+        &self,
+        device_id: Option<&str>,
+        track_uri: &str,
+        album_uri: Option<&str>,
+        position_ms: u64,
+    ) -> Result<()> {
+        let body = play_body(track_uri, album_uri, position_ms);
         self.request(Method::PUT, "/me/player/play", &device_query(device_id), Some(&body))
             .await?;
         Ok(())
@@ -147,6 +159,14 @@ impl SpotifyClient {
 
     pub async fn track(&self, id: &str) -> Result<Track> {
         self.get_json(&format!("/tracks/{id}"), &[]).await
+    }
+
+    /// Raw request for debugging (`spotitogether spotify raw`).
+    /// `path` may contain a query string.
+    pub async fn raw(&self, method: Method, path: &str, body: Option<&Value>) -> Result<(u16, String)> {
+        let resp = self.request(method, path, &[], body).await?;
+        let status = resp.status().as_u16();
+        Ok((status, resp.text().await?))
     }
 
     // ------------------------------------------------------------ plumbing
@@ -224,6 +244,13 @@ impl SpotifyClient {
     }
 }
 
+fn play_body(track_uri: &str, album_uri: Option<&str>, position_ms: u64) -> Value {
+    match album_uri.filter(|a| a.starts_with("spotify:album:")) {
+        Some(album) => json!({ "context_uri": album, "offset": { "uri": track_uri }, "position_ms": position_ms }),
+        None => json!({ "uris": [track_uri], "position_ms": position_ms }),
+    }
+}
+
 fn device_query(device_id: Option<&str>) -> Vec<(&'static str, String)> {
     device_id
         .map(|id| vec![("device_id", id.to_owned())])
@@ -259,6 +286,16 @@ fn classify(status: u16, message: String, reason: Option<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn play_body_prefers_album_context() {
+        assert_eq!(
+            play_body("spotify:track:t", Some("spotify:album:a"), 5),
+            json!({"context_uri": "spotify:album:a", "offset": {"uri": "spotify:track:t"}, "position_ms": 5})
+        );
+        assert_eq!(play_body("spotify:track:t", None, 5), json!({"uris": ["spotify:track:t"], "position_ms": 5}));
+        assert_eq!(play_body("spotify:track:t", Some(""), 0), json!({"uris": ["spotify:track:t"], "position_ms": 0}));
+    }
 
     #[test]
     fn classifies_player_errors() {

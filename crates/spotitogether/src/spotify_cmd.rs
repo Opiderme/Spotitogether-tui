@@ -49,6 +49,13 @@ pub enum SpotifyCmd {
     },
     /// Transfère la lecture vers un appareil (nom ou id)
     Transfer { device: String },
+    /// Requête brute à l'API (débogage) : raw PUT /me/player/play '{"uris":[...]}'
+    #[command(hide = true)]
+    Raw {
+        method: String,
+        path: String,
+        body: Option<String>,
+    },
 }
 
 pub async fn run(cmd: SpotifyCmd) -> Result<()> {
@@ -80,11 +87,12 @@ pub async fn run(cmd: SpotifyCmd) -> Result<()> {
                 let device = p.device.as_ref().map(|d| d.name.as_str()).unwrap_or("?");
                 match &p.item {
                     Some(t) => println!(
-                        "{} {}  {} / {}  sur {device}",
+                        "{} {}  {} / {}  sur {device}  ({})",
                         if p.is_playing { "▶" } else { "⏸" },
                         describe(t),
                         fmt_ms(p.progress_ms.unwrap_or(0)),
                         fmt_ms(t.duration_ms),
+                        t.uri,
                     ),
                     None => println!("Lecture sur {device} (contenu inconnu)"),
                 }
@@ -111,7 +119,8 @@ pub async fn run(cmd: SpotifyCmd) -> Result<()> {
                 println!("Lecture reprise.");
             } else {
                 let track = resolve_track(&client, &join_query(&target)?).await?;
-                client.play(device_id.as_deref(), std::slice::from_ref(&track.uri), position).await?;
+                let album = Some(track.album.uri.as_str()).filter(|u| !u.is_empty());
+                client.play_track(device_id.as_deref(), &track.uri, album, position).await?;
                 println!("▶ {}  à partir de {}", describe(&track), fmt_ms(position));
             }
         }
@@ -126,6 +135,12 @@ pub async fn run(cmd: SpotifyCmd) -> Result<()> {
             client.seek(device_id.as_deref(), ms).await?;
             println!("Position : {}", fmt_ms(ms));
         }
+        SpotifyCmd::Raw { method, path, body } => {
+            let method: spotify::Method = method.to_uppercase().parse().context("méthode HTTP invalide")?;
+            let body = body.map(|b| serde_json::from_str::<serde_json::Value>(&b)).transpose().context("JSON invalide")?;
+            let (status, text) = client.raw(method, &path, body.as_ref()).await?;
+            println!("{status} {text}");
+        }
         SpotifyCmd::Transfer { device } => {
             let id = resolve_device(&client, Some(&device)).await?.expect("device given");
             client.transfer(&id, true).await?;
@@ -135,7 +150,7 @@ pub async fn run(cmd: SpotifyCmd) -> Result<()> {
     Ok(())
 }
 
-fn connect() -> Result<SpotifyClient> {
+pub(crate) fn connect() -> Result<SpotifyClient> {
     let config = Config::load()?;
     let client_id = config.require_client_id()?.to_owned();
     let token = secrets::load()?.context("pas connecté à Spotify : lance `spotitogether login`")?;
@@ -163,7 +178,7 @@ async fn resolve_device(client: &SpotifyClient, wanted: Option<&str>) -> Result<
         if devices.iter().any(|d| d.is_active) {
             return Ok(None);
         }
-        return match pick_idle_device(&devices) {
+        return match spotify::models::pick_idle_device(&devices) {
             Some(d) => {
                 println!("Aucun appareil actif, utilisation de « {} ».", d.name);
                 Ok(d.id.clone())
@@ -186,14 +201,8 @@ async fn resolve_device(client: &SpotifyClient, wanted: Option<&str>) -> Result<
     }
 }
 
-/// First controllable device, preferring this computer over phones/speakers.
-fn pick_idle_device(devices: &[Device]) -> Option<&Device> {
-    let usable = || devices.iter().filter(|d| d.id.is_some() && !d.is_restricted);
-    usable().find(|d| d.kind == "Computer").or_else(|| usable().next())
-}
-
 /// URI, open.spotify.com link, or a search whose first result is used.
-async fn resolve_track(client: &SpotifyClient, target: &str) -> Result<Track> {
+pub(crate) async fn resolve_track(client: &SpotifyClient, target: &str) -> Result<Track> {
     if let Some(id) = track_id_from(target) {
         return Ok(client.track(&id).await?);
     }
@@ -223,7 +232,7 @@ fn url_path(target: &str) -> Option<&str> {
 }
 
 /// "1:23" -> 83 000 ms, "83" -> 83 000 ms.
-fn parse_position(s: &str) -> Result<u64> {
+pub(crate) fn parse_position(s: &str) -> Result<u64> {
     let s = s.trim();
     let secs = match s.split_once(':') {
         Some((m, sec)) => {
@@ -239,12 +248,12 @@ fn parse_position(s: &str) -> Result<u64> {
     Ok(secs * 1000)
 }
 
-fn fmt_ms(ms: u64) -> String {
+pub(crate) fn fmt_ms(ms: u64) -> String {
     let s = ms / 1000;
     format!("{}:{:02}", s / 60, s % 60)
 }
 
-fn describe(t: &Track) -> String {
+pub(crate) fn describe(t: &Track) -> String {
     let artists = t.artist_names();
     if artists.is_empty() { t.name.clone() } else { format!("{} — {artists}", t.name) }
 }
@@ -267,26 +276,6 @@ mod tests {
         assert_eq!(track_id_from("https://open.spotify.com/track/abc?si=x").as_deref(), Some("abc"));
         assert_eq!(track_id_from("https://open.spotify.com/intl-fr/track/abc").as_deref(), Some("abc"));
         assert_eq!(track_id_from("daft punk"), None);
-    }
-
-    fn dev(name: &str, kind: &str, restricted: bool) -> Device {
-        Device {
-            id: Some(name.to_owned()),
-            name: name.to_owned(),
-            kind: kind.to_owned(),
-            is_active: false,
-            is_restricted: restricted,
-            volume_percent: None,
-        }
-    }
-
-    #[test]
-    fn picks_computer_then_any_controllable_device() {
-        let devices = [dev("tel", "Smartphone", false), dev("pc", "Computer", false)];
-        assert_eq!(pick_idle_device(&devices).unwrap().name, "pc");
-        let devices = [dev("enceinte", "Speaker", true), dev("tel", "Smartphone", false)];
-        assert_eq!(pick_idle_device(&devices).unwrap().name, "tel");
-        assert!(pick_idle_device(&[dev("x", "Speaker", true)]).is_none());
     }
 
     #[test]
