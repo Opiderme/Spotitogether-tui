@@ -21,6 +21,8 @@ pub enum SyncEvent {
     Corrected { drift_ms: i64 },
     /// The local player was not playing the room's track; it is restarted.
     Resynced { reason: String },
+    /// Playback stopped on this account (no longer allowed to listen).
+    Stopped,
     /// A device was picked because none was active.
     DeviceSelected { name: String },
     Error(String),
@@ -104,6 +106,19 @@ impl Syncer {
         self.observe_latency(started.elapsed());
         self.applied = Some((item.track.uri.clone(), true));
         Ok(target)
+    }
+
+    /// Stops mirroring the room (the `Listen` permission was withdrawn).
+    pub async fn stop(&mut self, spotify: &SpotifyClient) -> Option<SyncEvent> {
+        let was_playing = matches!(self.applied, Some((_, true)));
+        self.applied = None;
+        if !was_playing {
+            return None;
+        }
+        match spotify.pause(self.device_id.as_deref()).await {
+            Ok(()) => Some(SyncEvent::Stopped),
+            Err(e) => Some(SyncEvent::Error(e.to_string())),
+        }
     }
 
     /// Compares the local player with the room and corrects drift.

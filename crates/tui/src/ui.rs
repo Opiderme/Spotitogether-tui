@@ -1,13 +1,13 @@
 //! Drawing. Records clickable regions in `app.areas` as it goes.
 
-use protocol::Role;
+use protocol::{Member, Perm, Role};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, HighlightSpacing, List, ListItem, Paragraph, Row, Table};
 
-use crate::app::{App, CoverCache, Focus, Level, SEARCH_PAGE};
+use crate::app::{App, CoverCache, Focus, Level, PERM_COLUMNS, SEARCH_PAGE};
 use crate::cover;
 
 const PREV: &str = "[ |◀ ]";
@@ -32,6 +32,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_members(f, app, members);
     draw_search(f, app, search);
     draw_status(f, app, status);
+    if app.perm_panel.is_some() {
+        draw_permissions(f, app, area);
+    }
     if app.show_help {
         draw_help(f, app, area);
     }
@@ -123,6 +126,11 @@ fn draw_now_playing(f: &mut Frame, app: &mut App, area: Rect) {
             Span::raw(play).fg(t.accent).bold(),
             Span::raw("  "),
             Span::raw(NEXT).fg(t.text),
+            Span::raw(match app.votes {
+                (0, _) if app.my_perms().skip => String::new(),
+                (votes, needed) => format!("      vote skip {votes}/{needed}"),
+            })
+            .fg(t.muted),
         ])),
         buttons,
     );
@@ -131,7 +139,9 @@ fn draw_now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     app.areas.play_button = button(8);
     app.areas.next_button = button(16);
 
-    let footer = if app.can_play {
+    let footer = if app.can_play && !app.my_perms().listen {
+        "Ton rôle ne permet pas d'écouter : rien n'est joué sur ton compte".to_owned()
+    } else if app.can_play {
         format!("Pochette : {} (c pour changer)", app.cover_mode.label())
     } else {
         "Mode spectateur : rien n'est joué sur ton compte".into()
@@ -222,17 +232,16 @@ fn draw_members(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|m| m.name.chars().count() + if m.id == app.me { 6 } else { 0 })
         .max()
         .unwrap_or(0);
-    let items = app.members.iter().map(|m| {
-        let (icon, role) = match m.role {
-            Role::Host => ("★", "Hôte"),
-            Role::Listener => ("·", "Auditeur"),
-        };
+    let host = app.is_host();
+    let items = app.members.iter().filter(|m| host || !m.pending).map(|m| {
         let me = if m.id == app.me { " (toi)" } else { "" };
         let name = format!("{}{me}", m.name);
+        let role = if m.pending { "en attente".to_owned() } else { m.role.label().to_owned() };
+        let custom = if m.overrides.is_empty() { "" } else { " *" };
         ListItem::new(Line::from(vec![
-            Span::raw(format!("{icon} ")).fg(if m.role == Role::Host { t.accent } else { t.muted }),
+            Span::raw(format!("{} ", role_icon(m.role))).fg(if m.role == Role::Host { t.accent } else { t.muted }),
             Span::raw(format!("{name:<name_w$}")).fg(t.text),
-            Span::raw(format!("  {role}")).fg(t.muted),
+            Span::raw(format!("  {role}{custom}")).fg(if m.pending { t.warn } else { t.muted }),
         ]))
     });
     let list = List::new(items).highlight_style(Style::new().bg(t.selection));
@@ -289,10 +298,10 @@ fn draw_search(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme;
     let me = app.me().map(|m| m.name.as_str()).unwrap_or("?");
-    let role = if app.is_host() { " (hôte)" } else { "" };
+    let role = app.me().map(|m| format!(" ({})", m.role.label().to_lowercase())).unwrap_or_default();
     let left = format!(
         " {} │ {} membre{} │ {me}{role} │ / chercher  espace pause  s suivant  ? aide  q quitter",
-        app.code,
+        app.settings.code,
         app.members.len(),
         if app.members.len() > 1 { "s" } else { "" },
     );
@@ -307,7 +316,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
 fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme;
     let w = 64.min(area.width);
-    let h = 22.min(area.height);
+    let h = 23.min(area.height);
     let popup = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
     f.render_widget(Clear, popup);
     let key = |k: &str, what: &str| Line::from(vec![Span::raw(format!("  {k:<14}")).fg(t.accent), Span::raw(what.to_owned()).fg(t.text)]);
@@ -318,13 +327,14 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         key("Entrée ou a", "ajouter le résultat sélectionné"),
         key("[ et ]", "page de résultats précédente / suivante"),
         key("espace", "lecture / pause du salon"),
-        key("s", "morceau suivant"),
+        key("s", "morceau suivant (ou vote, selon ton rôle)"),
         key("← →", "reculer / avancer de 10 s"),
         key("j k  ↑ ↓", "sélection dans le panneau"),
         key("J K", "déplacer le morceau dans la file"),
         key("d  Suppr", "retirer le morceau de la file"),
         key("r", "resynchroniser ton Spotify"),
         key("c", "pochette : ascii / blocs"),
+        key("p", "permissions des membres (hôte)"),
         key("q  Ctrl+C", "quitter le salon"),
         Line::default(),
         Line::from("  Souris : clic sur les boutons, la barre de progression,").fg(t.muted),
@@ -336,4 +346,102 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::new().fg(t.accent))
         .title(Line::from(" Aide · une touche pour fermer ").fg(t.accent).bold());
     f.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+fn role_icon(role: Role) -> &'static str {
+    match role {
+        Role::Host => "★",
+        Role::Dj => "♫",
+        Role::Listener => "·",
+        Role::Spectator => "○",
+    }
+}
+
+/// Permission cell: `[x]` granted, `[ ]` refused, `[~]` own tracks only,
+/// `[v]` vote only; `*` marks a per-member override.
+fn perm_cell(m: &Member, perm: Perm) -> String {
+    let p = m.perms;
+    let mark = match perm {
+        _ if p.get(perm) => "[x]",
+        Perm::QueueManage if p.queue_add => "[~]",
+        Perm::Skip if p.listen => "[v]",
+        _ => "[ ]",
+    };
+    let star = if m.overrides.contains_key(&perm) { "*" } else { " " };
+    format!("{mark}{star}")
+}
+
+fn draw_permissions(f: &mut Frame, app: &mut App, area: Rect) {
+    let t = app.theme;
+    let members: Vec<Member> = app.panel_members().into_iter().cloned().collect();
+    let w = 86.min(area.width);
+    let h = (members.len() as u16 + 10).min(area.height);
+    let popup = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
+    app.areas.perm_popup = popup;
+    f.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(t.accent))
+        .title(Line::from(format!(" Permissions · salon {} ", app.settings.code)).fg(t.accent).bold())
+        .title(Line::from(" Échap fermer ").fg(t.muted).right_aligned());
+    let inner = block.inner(popup).inner(Margin::new(1, 0));
+    f.render_widget(block, popup);
+
+    // Columns: name, role, then the permissions.
+    const NAME_W: u16 = 20;
+    const ROLE_W: u16 = 14;
+    const PERM_W: u16 = 9;
+    let mut cols = [(0u16, 0u16); PERM_COLUMNS];
+    for (i, col) in cols.iter_mut().enumerate() {
+        *col = match i {
+            0 => (inner.x + NAME_W, ROLE_W),
+            _ => (inner.x + NAME_W + ROLE_W + (i as u16 - 1) * PERM_W, PERM_W),
+        };
+    }
+    app.areas.perm_cols = cols;
+
+    let mut header = vec![Span::raw(format!("{:<w$}", "Membre", w = NAME_W as usize)), Span::raw(format!("{:<w$}", "Rôle", w = ROLE_W as usize))];
+    header.extend(Perm::ALL.iter().map(|p| Span::raw(format!("{:<w$}", p.label(), w = PERM_W as usize))));
+    let mut lines = vec![Line::default(), Line::from(header).fg(t.muted).bold()];
+
+    let panel = app.perm_panel.clone().unwrap_or_default();
+    for (row, m) in members.iter().enumerate() {
+        let cell_style = |col: usize| {
+            if row == panel.row && col == panel.col { Style::new().bg(t.accent).fg(t.selection).bold() } else { Style::new() }
+        };
+        let name: String = format!("{} {}", role_icon(m.role), m.name).chars().take(NAME_W as usize - 1).collect();
+        let role = if m.pending { "en attente".to_owned() } else { m.role.label().to_owned() };
+        let read_only = m.role == Role::Host;
+        let mut spans = vec![
+            Span::raw(format!("{name:<w$}", w = NAME_W as usize)).fg(t.text),
+            Span::styled(format!("{role:<w$}", w = ROLE_W as usize), cell_style(0)).fg(if m.pending { t.warn } else { t.text }),
+        ];
+        for (i, perm) in Perm::ALL.iter().enumerate() {
+            let text = format!("{:<w$}", perm_cell(m, *perm), w = PERM_W as usize);
+            let color = if read_only { t.muted } else if m.overrides.contains_key(perm) { t.warn } else { t.text };
+            spans.push(Span::styled(text, cell_style(i + 1)).fg(color));
+        }
+        let line = Line::from(spans);
+        lines.push(if row == panel.row { line.bg(t.selection) } else { line });
+    }
+    app.areas.perm_rows = Rect { x: inner.x, y: inner.y + 2, width: inner.width, height: members.len() as u16 };
+
+    let yes_no = |b: bool| if b { "oui" } else { "non" };
+    lines.extend([
+        Line::default(),
+        Line::from("[x] autorisé  [ ] refusé  [~] ses propres ajouts  [v] vote seulement  * exception").fg(t.muted),
+        Line::default(),
+        Line::from(vec![
+            Span::raw("Salle d'attente : ").fg(t.muted),
+            Span::raw(yes_no(app.settings.waiting_room)).fg(t.text),
+            Span::raw(" (w)   Rôle des nouveaux : ").fg(t.muted),
+            Span::raw(app.settings.default_role.label()).fg(t.text),
+            Span::raw(" (D)   Code : ").fg(t.muted),
+            Span::raw(app.settings.code.clone()).fg(t.text),
+            Span::raw(" (n)").fg(t.muted),
+        ]),
+        Line::from("↑↓ membre  ←→ colonne  espace/clic basculer  r rôle  x exception par défaut").fg(t.muted),
+        Line::from("a admettre  K exclure  b bannir (2 fois)  n nouveau code").fg(t.muted),
+    ]);
+    f.render_widget(Paragraph::new(lines), inner);
 }

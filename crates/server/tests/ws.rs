@@ -13,7 +13,7 @@ type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 async fn start() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(server::serve(listener, "ABC234".into(), "hosttoken".into()));
+    tokio::spawn(server::serve(listener, "ABC234".into(), "hosttoken".into(), None));
     format!("ws://{addr}/ws")
 }
 
@@ -47,7 +47,7 @@ async fn wait_for(ws: &mut Ws, pred: impl Fn(&ServerMsg) -> bool) -> ServerMsg {
 async fn join(url: &str, code: &str, name: &str, host: bool) -> Ws {
     let (mut ws, _) = connect_async(url).await.unwrap();
     let host_token = host.then(|| "hosttoken".to_owned());
-    send(&mut ws, &ClientMsg::Join { version: PROTOCOL_VERSION, code: code.into(), name: name.into(), host_token }).await;
+    send(&mut ws, &ClientMsg::Join { version: PROTOCOL_VERSION, code: code.into(), name: name.into(), host_token, spotify_id: None }).await;
     ws
 }
 
@@ -108,6 +108,48 @@ async fn wrong_codes_are_rejected_then_rate_limited() {
 async fn bad_version_is_rejected() {
     let url = start().await;
     let (mut ws, _) = connect_async(&url).await.unwrap();
-    send(&mut ws, &ClientMsg::Join { version: 999, code: "ABC234".into(), name: "x".into(), host_token: None }).await;
+    send(&mut ws, &ClientMsg::Join { version: 999, code: "ABC234".into(), name: "x".into(), host_token: None, spotify_id: None }).await;
     assert!(matches!(next(&mut ws).await, ServerMsg::Error { code: ErrorCode::BadVersion, .. }));
+}
+
+#[tokio::test]
+async fn kicked_member_is_told_then_disconnected() {
+    use protocol::AdminCmd;
+    let url = start().await;
+    let mut alex = join(&url, "ABC234", "Alex", true).await;
+    next(&mut alex).await; // welcome
+    let mut lou = join(&url, "ABC234", "Lou", false).await;
+    let ServerMsg::Welcome { member_id: lou_id, .. } = next(&mut lou).await else { panic!() };
+
+    send(&mut alex, &ClientMsg::Admin(AdminCmd::Kick { member: lou_id })).await;
+    wait_for(&mut lou, |m| matches!(m, ServerMsg::Error { code: ErrorCode::Kicked, .. })).await;
+    let end = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match lou.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                Some(Ok(_)) => continue,
+            }
+        }
+    })
+    .await;
+    assert!(end.is_ok(), "connection should close");
+    wait_for(&mut alex, |m| matches!(m, ServerMsg::Members { members } if members.len() == 1)).await;
+}
+
+#[tokio::test]
+async fn waiting_room_admission_over_the_wire() {
+    use protocol::AdminCmd;
+    let url = start().await;
+    let mut alex = join(&url, "ABC234", "Alex", true).await;
+    next(&mut alex).await;
+    send(&mut alex, &ClientMsg::Admin(AdminCmd::SetWaitingRoom { enabled: true })).await;
+    wait_for(&mut alex, |m| matches!(m, ServerMsg::Settings(s) if s.waiting_room)).await;
+
+    let mut lou = join(&url, "ABC234", "Lou", false).await;
+    assert_eq!(next(&mut lou).await, ServerMsg::Waiting);
+    let ServerMsg::Members { members } = wait_for(&mut alex, |m| matches!(m, ServerMsg::Members { members } if members.len() == 2)).await else { unreachable!() };
+    let pending = members.iter().find(|m| m.pending).unwrap().id;
+
+    send(&mut alex, &ClientMsg::Admin(AdminCmd::Admit { member: pending })).await;
+    assert!(matches!(next(&mut lou).await, ServerMsg::Welcome { .. }));
 }

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use client::{Event, JoinOptions, SyncEvent, parse_invite};
-use protocol::{ClientMsg, Member, Playback, QueueItem, Role, ServerMsg};
+use protocol::{ClientMsg, Member, Playback, QueueItem, ServerMsg};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
 
@@ -19,7 +19,16 @@ use crate::spotify_cmd::{connect, fmt_ms, parse_position, resolve_track};
 
 // ------------------------------------------------------------------ serve
 
-pub async fn serve(port: u16, bind: IpAddr, code: Option<String>) -> Result<()> {
+pub struct ServeArgs {
+    pub port: u16,
+    pub bind: IpAddr,
+    pub code: Option<String>,
+    pub data: Option<PathBuf>,
+    pub ephemeral: bool,
+}
+
+pub async fn serve(args: ServeArgs) -> Result<()> {
+    let ServeArgs { port, bind, code, data, ephemeral } = args;
     let code = code.map(|c| c.trim().to_uppercase()).unwrap_or_else(server::generate_code);
     if code.len() < 4 || !code.chars().all(|c| c.is_ascii_alphanumeric()) {
         bail!("code invalide : au moins 4 lettres ou chiffres");
@@ -29,6 +38,20 @@ pub async fn serve(port: u16, bind: IpAddr, code: Option<String>) -> Result<()> 
         .await
         .with_context(|| format!("impossible d'écouter sur {bind}:{port}"))?;
     let token_file = save_host_token(port, &host_token);
+    let store = if ephemeral {
+        None
+    } else {
+        let path = match data {
+            Some(p) => p,
+            None => project_dirs()?.data_dir().join(format!("room-{port}.sqlite")),
+        };
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).with_context(|| format!("création de {}", dir.display()))?;
+        }
+        let store = server::Store::open(&path).with_context(|| format!("ouverture de {}", path.display()))?;
+        println!("Rôles, bannis et réglages enregistrés dans {}", path.display());
+        Some(store)
+    };
 
     // Listening on every interface: advertise the LAN address.
     let lan = if bind.is_unspecified() {
@@ -40,12 +63,15 @@ pub async fn serve(port: u16, bind: IpAddr, code: Option<String>) -> Result<()> 
     println!("Invitation à partager : spotitogether://{lan}:{port}/{code}");
     println!("  (hors de ton réseau local : Tailscale, Caddy ou redirection de port, voir le README)\n");
     match token_file {
-        Ok(_) => println!("Pour rejoindre en tant qu'hôte, sur cette machine :\n  spotitogether join spotitogether://127.0.0.1:{port}/{code}\n"),
+        Ok(_) => println!(
+            "Pour rejoindre en tant qu'hôte, sur cette machine :\n  spotitogether join spotitogether://127.0.0.1:{port}/{code}\n\
+             Pour tester en invité sur cette machine : ajoute --guest\n"
+        ),
         Err(_) => println!("Pour rejoindre en tant qu'hôte :\n  spotitogether join spotitogether://127.0.0.1:{port}/{code} --host-token {host_token}\n"),
     }
     println!("Ctrl+C pour fermer le salon.");
 
-    server::serve(listener, code, host_token).await?;
+    server::serve(listener, code, host_token, store).await?;
     Ok(())
 }
 
@@ -86,6 +112,7 @@ pub struct JoinArgs {
     pub code: Option<String>,
     pub name: Option<String>,
     pub host_token: Option<String>,
+    pub guest: bool,
     pub spectator: bool,
     pub plain: bool,
 }
@@ -102,7 +129,8 @@ Commandes :
   /add <recherche | lien | URI>   ajoute un morceau à la file (texte sans / = /add)
   /queue                          affiche la file
   /rm <n>                         retire le morceau n de la file
-  /play  /pause  /skip            contrôle du salon
+  /play  /pause  /skip            contrôle du salon (selon ton rôle)
+  /vote                           vote pour passer le morceau
   /seek <m:ss>                    se déplace dans le morceau
   /who                            membres du salon
   /quit                           quitte le salon";
@@ -112,18 +140,31 @@ pub async fn join(args: JoinArgs) -> Result<()> {
     let code = args.code.or(invite.code).context("code du salon manquant : spotitogether://hôte:port/CODE ou --code")?;
 
     let spotify = if args.spectator { None } else { Some(Arc::new(connect()?)) };
-    let name = match (args.name, &spotify) {
+    let profile = match &spotify {
+        Some(sp) => Some(sp.me().await.context("lecture du profil Spotify")?),
+        None => None,
+    };
+    let name = match (args.name, &profile) {
         (Some(n), _) => n,
-        (None, Some(sp)) => {
-            let me = sp.me().await.context("lecture du profil Spotify")?;
-            me.display_name.unwrap_or(me.id)
-        }
+        (None, Some(me)) => me.display_name.clone().unwrap_or_else(|| me.id.clone()),
         (None, None) => "Spectateur".into(),
     };
-    let host_token = args.host_token.or_else(|| local_port(&invite.ws_url).and_then(load_host_token));
+    // On the server's machine the host token is picked up automatically,
+    // unless `--guest` asks to join as a regular member.
+    let host_token = match args.guest {
+        true => None,
+        false => args.host_token.or_else(|| local_port(&invite.ws_url).and_then(load_host_token)),
+    };
 
     let mut joined = client::join(
-        JoinOptions { ws_url: invite.ws_url, code: code.to_uppercase(), name, host_token },
+        JoinOptions {
+            ws_url: invite.ws_url,
+            code: code.to_uppercase(),
+            name,
+            host_token,
+            spotify_id: profile.map(|p| p.id),
+            on_waiting: Some(Box::new(|| println!("Salle d'attente : l'hôte doit t'admettre…"))),
+        },
         spotify.clone(),
     )
     .await?;
@@ -143,9 +184,9 @@ pub async fn join(args: JoinArgs) -> Result<()> {
     let me = view.members.iter().find(|m| m.id == joined.member_id);
     println!(
         "Dans le salon {} en tant que {}{}.",
-        joined.room.code,
+        joined.room.settings.code,
         me.map(|m| m.name.as_str()).unwrap_or("?"),
-        if me.is_some_and(|m| m.role == Role::Host) { " (hôte)" } else { "" }
+        me.map(|m| format!(" ({})", m.role.label().to_lowercase())).unwrap_or_default()
     );
     if spotify.is_none() {
         println!("Mode spectateur : rien n'est joué sur ton compte.");
@@ -213,6 +254,7 @@ async fn run_command(
         "play" => ClientMsg::Play,
         "pause" => ClientMsg::Pause,
         "skip" | "next" => ClientMsg::Skip,
+        "vote" => ClientMsg::VoteSkip,
         "seek" => ClientMsg::Seek { position_ms: parse_position(arg)? },
         "queue" | "q" => {
             print_queue(&view.queue);
@@ -275,7 +317,9 @@ fn show_server_msg(msg: ServerMsg, view: &mut View) {
             view.members = members;
         }
         ServerMsg::Error { message, .. } => println!("⚠ {message}"),
-        ServerMsg::Welcome { .. } | ServerMsg::Pong { .. } => {}
+        ServerMsg::SkipVotes { votes, needed } if votes > 0 => println!("Votes pour passer : {votes}/{needed}"),
+        ServerMsg::Settings(s) => println!("Code du salon : {}", s.code),
+        ServerMsg::Welcome { .. } | ServerMsg::Pong { .. } | ServerMsg::Waiting | ServerMsg::SkipVotes { .. } => {}
     }
 }
 
@@ -289,6 +333,7 @@ fn show_sync_event(e: SyncEvent) {
         SyncEvent::Corrected { drift_ms } => {
             println!("  ↳ dérive de {:.1} s corrigée", drift_ms as f64 / 1000.0);
         }
+        SyncEvent::Stopped => println!("  ↳ écoute désactivée par l'hôte"),
         SyncEvent::DeviceSelected { name } => println!("Appareil Spotify : {name}"),
         SyncEvent::Error(e) => println!("⚠ Spotify : {e}"),
     }
@@ -320,7 +365,8 @@ fn print_queue(queue: &[QueueItem]) {
 fn print_members(members: &[Member]) {
     let list: Vec<String> = members
         .iter()
-        .map(|m| if m.role == Role::Host { format!("{} (hôte)", m.name) } else { m.name.clone() })
+        .filter(|m| !m.pending)
+        .map(|m| format!("{} ({})", m.name, m.role.label().to_lowercase()))
         .collect();
     println!("Membres : {}", list.join(", "));
 }

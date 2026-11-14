@@ -41,6 +41,13 @@ enum Command {
         /// Code d'invitation choisi (sinon généré au hasard)
         #[arg(long)]
         code: Option<String>,
+        /// Base SQLite des rôles, bannis et réglages
+        /// (défaut : ~/.local/share/spotitogether/room-<port>.sqlite)
+        #[arg(long)]
+        data: Option<std::path::PathBuf>,
+        /// Ne rien enregistrer sur disque
+        #[arg(long, conflicts_with = "data")]
+        ephemeral: bool,
     },
     /// Rejoint un salon : spotitogether join spotitogether://hôte:port/CODE
     Join {
@@ -53,8 +60,11 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
         /// Jeton d'hôte affiché par `serve` (automatique sur la même machine)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "guest")]
         host_token: Option<String>,
+        /// Rejoindre en invité, même sur la machine de l'hôte (pour tester les droits)
+        #[arg(long)]
+        guest: bool,
         /// Rejoindre sans rien jouer sur ton compte Spotify
         #[arg(long)]
         spectator: bool,
@@ -87,9 +97,11 @@ async fn run(cli: Cli) -> Result<()> {
             println!("Jeton Spotify supprimé.");
             Ok(())
         }
-        Command::Serve { port, bind, code } => room_cmd::serve(port, bind, code).await,
-        Command::Join { invite, code, name, host_token, spectator, plain } => {
-            room_cmd::join(room_cmd::JoinArgs { invite, code, name, host_token, spectator, plain }).await
+        Command::Serve { port, bind, code, data, ephemeral } => {
+            room_cmd::serve(room_cmd::ServeArgs { port, bind, code, data, ephemeral }).await
+        }
+        Command::Join { invite, code, name, host_token, guest, spectator, plain } => {
+            room_cmd::join(room_cmd::JoinArgs { invite, code, name, host_token, guest, spectator, plain }).await
         }
         Command::Spotify(cmd) => spotify_cmd::run(cmd).await,
     }

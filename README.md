@@ -4,8 +4,7 @@
 sur sa machine, les autres le rejoignent avec un code, et chacun entend la même
 musique sur son propre compte Spotify.
 
-> État : phase 3 (salon, synchro et interface TUI plein écran). Les
-> permissions par rôle arrivent en phase 4.
+> État : phase 4 (salon, synchro, interface TUI et permissions par rôle).
 
 ## Prérequis
 
@@ -40,6 +39,9 @@ spotitogether join spotitogether://127.0.0.1:7420/K7XQ2M
 
 # Chez un ami
 spotitogether join spotitogether://192.168.1.19:7420/K7XQ2M
+
+# Tester en invité depuis la machine de l'hôte
+spotitogether join spotitogether://127.0.0.1:7420/K7XQ2M --guest --spectator --name Test
 ```
 
 `join` ouvre l'interface plein écran, pilotable au clavier et à la souris :
@@ -51,6 +53,7 @@ spotitogether join spotitogether://192.168.1.19:7420/K7XQ2M
 | `j` `k`, `J` `K`, `d` | sélection, déplacement et retrait dans la file |
 | `r` | resynchroniser ton Spotify |
 | `c` | pochette en ASCII ou en blocs colorés |
+| `p` | permissions des membres (hôte) |
 | `?`, `q` | aide, quitter |
 
 À la souris : boutons, barre de progression (clic pour se déplacer), glisser une
@@ -60,6 +63,24 @@ thème Caelestia s'il est présent (rechargé quand le fond d'écran change).
 
 Chacun entend la musique sur son propre compte ; une dérive de plus de 1,5 s est
 corrigée automatiquement.
+
+## Rôles et permissions
+
+| Permission | Hôte | DJ | Auditeur | Spectateur |
+| --- | --- | --- | --- | --- |
+| Écouter en synchro | oui | oui | oui | non |
+| Ajouter à la file | oui | oui | oui, 2 en attente max | non |
+| Retirer / réordonner la file | oui | oui | ses propres ajouts | non |
+| Lecture, pause, position | oui | oui | non | non |
+| Passer le morceau | oui | oui | vote (majorité) | non |
+
+L'hôte ouvre le panneau `p` pour changer le rôle d'un membre, lui accorder ou
+retirer une permission précise (exception marquée `*`), l'exclure, le bannir,
+activer la salle d'attente (chaque entrée doit être admise), choisir le rôle des
+nouveaux arrivants ou générer un nouveau code. Rôles, exceptions, bannis et
+réglages sont gardés dans `~/.local/share/spotitogether/room-<port>.sqlite`
+(`serve --ephemeral` pour ne rien enregistrer). Les droits sont vérifiés par le
+serveur, quel que soit le client utilisé.
 
 Chaque utilisateur crée sa propre app sur le
 [dashboard Spotify](https://developer.spotify.com/dashboard) : depuis février 2026,

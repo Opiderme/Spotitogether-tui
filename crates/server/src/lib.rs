@@ -4,10 +4,11 @@
 //! timer for the current track; clients mirror that state on their account.
 
 mod room;
+mod store;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
@@ -21,7 +22,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 pub use room::Room;
-use room::Out;
+use room::{JoinRequest, Out};
+pub use store::Store;
 
 const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_BAD_CODES: usize = 5;
@@ -55,8 +57,10 @@ enum Cmd {
     Join {
         name: String,
         host_token: Option<String>,
+        spotify_id: Option<String>,
+        ip: IpAddr,
         tx: mpsc::UnboundedSender<ServerMsg>,
-        reply: oneshot::Sender<MemberId>,
+        reply: oneshot::Sender<Result<MemberId, (ErrorCode, String)>>,
     },
     Msg {
         from: MemberId,
@@ -70,17 +74,20 @@ enum Cmd {
 #[derive(Clone)]
 struct AppState {
     room_tx: mpsc::UnboundedSender<Cmd>,
-    code: Arc<str>,
+    /// Current invite code (the host can rotate it).
+    code: Arc<RwLock<String>>,
     bad_codes: Arc<Mutex<HashMap<IpAddr, Vec<std::time::Instant>>>>,
 }
 
-/// Serves the room on `listener` until the process stops.
-pub async fn serve(listener: TcpListener, code: String, host_token: String) -> std::io::Result<()> {
-    let room = Room::new(code.clone(), host_token, now_ms());
+/// Serves the room on `listener` until the process stops. With a `store`,
+/// roles, bans and settings persist across restarts.
+pub async fn serve(listener: TcpListener, code: String, host_token: String, store: Option<Store>) -> std::io::Result<()> {
+    let room = Room::new(code.clone(), host_token, now_ms(), store);
     let (room_tx, room_rx) = mpsc::unbounded_channel();
-    tokio::spawn(run_room(room, room_rx));
+    let code = Arc::new(RwLock::new(code));
+    tokio::spawn(run_room(room, room_rx, code.clone()));
 
-    let state = AppState { room_tx, code: code.into(), bad_codes: Default::default() };
+    let state = AppState { room_tx, code, bad_codes: Default::default() };
     let app = Router::new()
         .route(WS_PATH, get(ws_handler))
         .route("/health", get(|| async { "ok" }))
@@ -90,7 +97,7 @@ pub async fn serve(listener: TcpListener, code: String, host_token: String) -> s
 
 /// Single task owning the room: applies commands in order and fires the
 /// end-of-track timer.
-async fn run_room(mut room: Room, mut rx: mpsc::UnboundedReceiver<Cmd>) {
+async fn run_room(mut room: Room, mut rx: mpsc::UnboundedReceiver<Cmd>, shared_code: Arc<RwLock<String>>) {
     let mut conns: HashMap<MemberId, mpsc::UnboundedSender<ServerMsg>> = HashMap::new();
     loop {
         // +5 ms so the timer never fires before the deadline (no busy loop).
@@ -108,33 +115,55 @@ async fn run_room(mut room: Room, mut rx: mpsc::UnboundedReceiver<Cmd>) {
         let now = now_ms();
         let outs = match cmd {
             None => room.tick(now),
-            Some(Cmd::Join { name, host_token, tx, reply }) => {
-                let (id, outs) = room.join(&name, host_token.as_deref());
-                let _ = tx.send(ServerMsg::Welcome { member_id: id, room: room.snapshot() });
-                conns.insert(id, tx);
-                let _ = reply.send(id);
-                tracing::info!(id, name = room.member_name(id), "member joined");
-                outs
+            Some(Cmd::Join { name, host_token, spotify_id, ip, tx, reply }) => {
+                let request = JoinRequest { name: &name, host_token: host_token.as_deref(), spotify_id: spotify_id.as_deref(), ip };
+                match room.join(request) {
+                    Ok((id, outs)) => {
+                        conns.insert(id, tx);
+                        let _ = reply.send(Ok(id));
+                        tracing::info!(id, name = room.member_name(id), "member joined");
+                        outs
+                    }
+                    Err(rejection) => {
+                        tracing::info!(%ip, reason = rejection.1, "join refused");
+                        let _ = reply.send(Err(rejection));
+                        vec![]
+                    }
+                }
             }
             Some(Cmd::Msg { from, msg }) => room.handle(from, msg, now),
             Some(Cmd::Leave { id }) => {
                 conns.remove(&id);
                 tracing::info!(id, "member left");
-                room.leave(id)
+                room.leave(id, now)
             }
         };
 
         for out in outs {
             match out {
-                Out::All(msg) => conns.values().for_each(|tx| {
-                    let _ = tx.send(msg.clone());
-                }),
+                Out::All(msg) => {
+                    for (id, tx) in &conns {
+                        if room.is_admitted(*id) {
+                            let _ = tx.send(msg.clone());
+                        }
+                    }
+                }
                 Out::One(id, msg) => {
                     if let Some(tx) = conns.get(&id) {
                         let _ = tx.send(msg);
                     }
                 }
+                // Dropping the sender ends the connection task once it has
+                // flushed what was already queued.
+                Out::Close(id) => {
+                    conns.remove(&id);
+                }
             }
+        }
+
+        if *shared_code.read().expect("lock") != room.code() {
+            *shared_code.write().expect("lock") = room.code().to_owned();
+            tracing::info!(code = room.code(), "invite code rotated");
         }
     }
 }
@@ -190,8 +219,8 @@ impl AppState {
 }
 
 async fn handle_socket(mut socket: WebSocket, ip: IpAddr, state: AppState) {
-    let (name, host_token) = match tokio::time::timeout(JOIN_TIMEOUT, recv(&mut socket)).await {
-        Ok(Some(Ok(ClientMsg::Join { version, code, name, host_token }))) => {
+    let (name, host_token, spotify_id) = match tokio::time::timeout(JOIN_TIMEOUT, recv(&mut socket)).await {
+        Ok(Some(Ok(ClientMsg::Join { version, code, name, host_token, spotify_id }))) => {
             if version != PROTOCOL_VERSION {
                 let msg = format!("version de protocole {version} non supportée (serveur : {PROTOCOL_VERSION})");
                 return reject(socket, ErrorCode::BadVersion, &msg).await;
@@ -199,12 +228,13 @@ async fn handle_socket(mut socket: WebSocket, ip: IpAddr, state: AppState) {
             if state.is_blocked(ip) {
                 return reject(socket, ErrorCode::TooManyAttempts, "trop de codes erronés, réessaie dans une minute").await;
             }
-            if !state.code.eq_ignore_ascii_case(code.trim()) {
+            let current = state.code.read().expect("lock").clone();
+            if !current.eq_ignore_ascii_case(code.trim()) {
                 state.record_bad_code(ip);
                 tracing::warn!(%ip, "wrong room code");
                 return reject(socket, ErrorCode::BadCode, "code de salon incorrect").await;
             }
-            (name, host_token)
+            (name, host_token, spotify_id)
         }
         Ok(Some(_)) => return reject(socket, ErrorCode::NotJoined, "le premier message doit être join").await,
         _ => return,
@@ -212,10 +242,14 @@ async fn handle_socket(mut socket: WebSocket, ip: IpAddr, state: AppState) {
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (reply_tx, reply_rx) = oneshot::channel();
-    if state.room_tx.send(Cmd::Join { name, host_token, tx, reply: reply_tx }).is_err() {
+    if state.room_tx.send(Cmd::Join { name, host_token, spotify_id, ip, tx, reply: reply_tx }).is_err() {
         return;
     }
-    let Ok(id) = reply_rx.await else { return };
+    let id = match reply_rx.await {
+        Ok(Ok(id)) => id,
+        Ok(Err((code, message))) => return reject(socket, code, &message).await,
+        Err(_) => return,
+    };
 
     loop {
         tokio::select! {

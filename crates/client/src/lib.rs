@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use protocol::{ClientMsg, DEFAULT_PORT, MemberId, PROTOCOL_VERSION, Playback, RoomSnapshot, ServerMsg, WS_PATH};
+use protocol::{ClientMsg, DEFAULT_PORT, ErrorCode, MemberId, PROTOCOL_VERSION, Playback, RoomSnapshot, ServerMsg, WS_PATH};
 use spotify::SpotifyClient;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until};
@@ -74,6 +74,9 @@ pub struct JoinOptions {
     pub code: String,
     pub name: String,
     pub host_token: Option<String>,
+    pub spotify_id: Option<String>,
+    /// Called if the room has a waiting room and the host must admit us.
+    pub on_waiting: Option<Box<dyn FnOnce() + Send>>,
 }
 
 #[derive(Debug, Clone)]
@@ -136,7 +139,14 @@ pub struct Joined {
 /// Joins the room. Without `spotify` the client only watches (spectator).
 pub async fn join(opts: JoinOptions, spotify: Option<Arc<SpotifyClient>>) -> Result<Joined, Error> {
     let (mut ws, _) = connect_async(opts.ws_url.as_str()).await?;
-    let join = ClientMsg::Join { version: PROTOCOL_VERSION, code: opts.code, name: opts.name, host_token: opts.host_token };
+    let join = ClientMsg::Join {
+        version: PROTOCOL_VERSION,
+        code: opts.code,
+        name: opts.name,
+        host_token: opts.host_token,
+        spotify_id: opts.spotify_id,
+    };
+    let mut on_waiting = opts.on_waiting;
     ws.send(Message::text(serde_json::to_string(&join).expect("serializable"))).await?;
 
     let (member_id, room) = loop {
@@ -145,6 +155,11 @@ pub async fn join(opts: JoinOptions, spotify: Option<Arc<SpotifyClient>>) -> Res
             Some(Err(e)) => return Err(e.into()),
             Some(Ok(Message::Text(t))) => match serde_json::from_str::<ServerMsg>(t.as_str()) {
                 Ok(ServerMsg::Welcome { member_id, room }) => break (member_id, room),
+                Ok(ServerMsg::Waiting) => {
+                    if let Some(f) = on_waiting.take() {
+                        f();
+                    }
+                }
                 Ok(ServerMsg::Error { message, .. }) => return Err(Error::Rejected(message)),
                 Ok(other) => return Err(Error::Protocol(format!("{other:?}"))),
                 Err(e) => return Err(Error::Protocol(e.to_string())),
@@ -155,8 +170,17 @@ pub async fn join(opts: JoinOptions, spotify: Option<Arc<SpotifyClient>>) -> Res
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let can_listen = room.members.iter().find(|m| m.id == member_id).is_some_and(|m| m.perms.listen);
+    let spotify = spotify.map(|sp| Listener { spotify: sp, member_id, can_listen });
     tokio::spawn(run(ws, cmd_rx, event_tx, room.playback.clone(), spotify));
     Ok(Joined { member_id, room, handle: RoomHandle { tx: cmd_tx }, events: event_rx })
+}
+
+/// The local Spotify, played only while the member has the `Listen` permission.
+struct Listener {
+    spotify: Arc<SpotifyClient>,
+    member_id: MemberId,
+    can_listen: bool,
 }
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -166,7 +190,7 @@ async fn run(
     mut commands: mpsc::UnboundedReceiver<Command>,
     events: mpsc::UnboundedSender<Event>,
     mut playback: Playback,
-    spotify: Option<Arc<SpotifyClient>>,
+    mut listener: Option<Listener>,
 ) {
     let emit = |e: Event| {
         let _ = events.send(e);
@@ -174,12 +198,16 @@ async fn run(
     let mut clock = Clock::default();
     let mut syncer = Syncer::new(None);
     // Apply the room state once the clock is calibrated.
-    let mut pending_apply = spotify.is_some();
-    if let Some(sp) = &spotify
-        && let Some(e) = syncer.choose_device(sp).await
+    let active = |l: &Option<Listener>| l.as_ref().is_some_and(|l| l.can_listen);
+    let mut pending_apply = active(&listener);
+    if let Some(l) = &listener
+        && l.can_listen
+        && let Some(e) = syncer.choose_device(&l.spotify).await
     {
         emit(Event::Sync(e));
     }
+    // Kick/ban reason, reported when the server then closes the socket.
+    let mut close_reason: Option<String> = None;
 
     let mut pings_sent = 0u32;
     let mut next_ping = Instant::now();
@@ -190,13 +218,13 @@ async fn run(
         tokio::select! {
             frame = ws.next() => {
                 let msg = match frame {
-                    None => break "connexion fermée par le serveur".to_owned(),
-                    Some(Err(e)) => break e.to_string(),
+                    None => break close_reason.take().unwrap_or_else(|| "connexion fermée par le serveur".to_owned()),
+                    Some(Err(e)) => break close_reason.take().unwrap_or_else(|| e.to_string()),
                     Some(Ok(Message::Text(t))) => match serde_json::from_str::<ServerMsg>(t.as_str()) {
                         Ok(m) => m,
                         Err(e) => { tracing::warn!(%e, "unparsable server message"); continue; }
                     },
-                    Some(Ok(Message::Close(_))) => break "le serveur a fermé le salon".to_owned(),
+                    Some(Ok(Message::Close(_))) => break close_reason.take().unwrap_or_else(|| "le serveur a fermé le salon".to_owned()),
                     Some(Ok(_)) => continue,
                 };
                 match &msg {
@@ -207,7 +235,23 @@ async fn run(
                     }
                     ServerMsg::Playback(p) if p.seq > playback.seq => {
                         playback = p.clone();
-                        pending_apply = spotify.is_some();
+                        pending_apply = active(&listener);
+                    }
+                    ServerMsg::Members { members } => {
+                        if let Some(l) = &mut listener {
+                            let now = members.iter().find(|m| m.id == l.member_id).is_some_and(|m| m.perms.listen);
+                            if now != l.can_listen {
+                                l.can_listen = now;
+                                if now {
+                                    pending_apply = true;
+                                } else if let Some(e) = syncer.stop(&l.spotify).await {
+                                    emit(Event::Sync(e));
+                                }
+                            }
+                        }
+                    }
+                    ServerMsg::Error { code: ErrorCode::Kicked | ErrorCode::Banned, message } => {
+                        close_reason = Some(message.clone());
                     }
                     ServerMsg::Playback(_) => continue, // stale
                     _ => {}
@@ -219,7 +263,7 @@ async fn run(
                     let json = serde_json::to_string(&msg).expect("serializable");
                     if let Err(e) = ws.send(Message::text(json)).await { break e.to_string(); }
                 }
-                Some(Command::Resync) => pending_apply = spotify.is_some(),
+                Some(Command::Resync) => pending_apply = active(&listener),
                 None => {
                     let _ = ws.close(None).await;
                     return;
@@ -231,9 +275,9 @@ async fn run(
                 pings_sent += 1;
                 next_ping = Instant::now() + if pings_sent < INITIAL_PINGS { INITIAL_PING_EVERY } else { PING_EVERY };
             }
-            _ = drift_check.tick(), if spotify.is_some() && clock.is_ready() && !pending_apply => {
-                if let Some(sp) = &spotify {
-                    let events = syncer.check(sp, &clock, &playback).await;
+            _ = drift_check.tick(), if active(&listener) && clock.is_ready() && !pending_apply => {
+                if let Some(l) = &listener {
+                    let events = syncer.check(&l.spotify, &clock, &playback).await;
                     let resynced = events.iter().any(|e| matches!(e, SyncEvent::Resynced { .. }));
                     events.into_iter().for_each(|e| emit(Event::Sync(e)));
                     if resynced {
@@ -245,8 +289,8 @@ async fn run(
 
         if pending_apply && clock.is_ready() {
             pending_apply = false;
-            if let Some(sp) = &spotify {
-                for e in syncer.apply(sp, &clock, &playback).await {
+            if let Some(l) = listener.as_ref().filter(|l| l.can_listen) {
+                for e in syncer.apply(&l.spotify, &clock, &playback).await {
                     emit(Event::Sync(e));
                 }
             }

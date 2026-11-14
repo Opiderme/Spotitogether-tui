@@ -4,10 +4,12 @@
 //! The server is the single source of truth; clients only mirror its state
 //! on their own Spotify account.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change; the server rejects other versions.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Path of the WebSocket endpoint on the server.
 pub const WS_PATH: &str = "/ws";
@@ -28,6 +30,10 @@ pub enum ClientMsg {
         name: String,
         #[serde(default)]
         host_token: Option<String>,
+        /// Spotify user id, used to remember roles and bans across sessions.
+        /// Self-declared by the client: good enough among friends, not proof.
+        #[serde(default)]
+        spotify_id: Option<String>,
     },
     /// Clock sync: `t0` is the client's wall clock in ms, echoed back.
     Ping { t0: u64 },
@@ -38,7 +44,30 @@ pub enum ClientMsg {
     Play,
     Pause,
     Seek { position_ms: u64 },
+    /// Immediate skip (needs `Perm::Skip`).
     Skip,
+    /// Vote to skip the current track; it is skipped once more than half of
+    /// the listeners voted.
+    VoteSkip,
+    /// Host only.
+    Admin(AdminCmd),
+}
+
+/// Room administration, reserved to the host.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum AdminCmd {
+    SetRole { member: MemberId, role: Role },
+    /// `value: None` removes the override (back to the role default).
+    SetPerm { member: MemberId, perm: Perm, value: Option<bool> },
+    Kick { member: MemberId },
+    Ban { member: MemberId },
+    /// Lets a member out of the waiting room.
+    Admit { member: MemberId },
+    SetWaitingRoom { enabled: bool },
+    SetDefaultRole { role: Role },
+    /// Generates a new invite code (members already inside stay).
+    RotateCode,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -49,6 +78,10 @@ pub enum ServerMsg {
     Playback(Playback),
     Queue { items: Vec<QueueItem> },
     Members { members: Vec<Member> },
+    Settings(RoomSettings),
+    SkipVotes { votes: u32, needed: u32 },
+    /// Sent instead of `Welcome` while the host has not admitted the member.
+    Waiting,
     Error { code: ErrorCode, message: String },
 }
 
@@ -62,6 +95,9 @@ pub enum ErrorCode {
     InvalidMessage,
     NotFound,
     Forbidden,
+    Kicked,
+    Banned,
+    Refused,
 }
 
 /// Track metadata sent by the client that queues it (batch track lookup is
@@ -85,6 +121,8 @@ pub struct QueueItem {
     pub id: ItemId,
     pub track: TrackInfo,
     pub added_by: String,
+    #[serde(default)]
+    pub added_by_id: MemberId,
 }
 
 /// Playback state anchored on the server clock: at `server_ms` the track was
@@ -114,23 +152,149 @@ impl Playback {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
     Host,
+    Dj,
     Listener,
+    Spectator,
 }
+
+impl Role {
+    /// Roles the host can hand out (the host role comes from the host token).
+    pub const ASSIGNABLE: [Role; 3] = [Role::Dj, Role::Listener, Role::Spectator];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Role::Host => "Hôte",
+            Role::Dj => "DJ",
+            Role::Listener => "Auditeur",
+            Role::Spectator => "Spectateur",
+        }
+    }
+
+    /// Default permissions of the role (see the plan's matrix).
+    pub fn defaults(self) -> Permissions {
+        let all = Permissions { listen: true, queue_add: true, queue_manage: true, playback: true, skip: true };
+        match self {
+            Role::Host | Role::Dj => all,
+            Role::Listener => Permissions { listen: true, queue_add: true, ..Permissions::NONE },
+            Role::Spectator => Permissions::NONE,
+        }
+    }
+
+    pub fn next_assignable(self) -> Role {
+        match self {
+            Role::Dj => Role::Listener,
+            Role::Listener => Role::Spectator,
+            Role::Spectator | Role::Host => Role::Dj,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Perm {
+    /// Hear the room on one's own Spotify.
+    Listen,
+    /// Add tracks (limited to a few pending tracks without `QueueManage`).
+    QueueAdd,
+    /// Remove and reorder anyone's tracks (own tracks can always be removed).
+    QueueManage,
+    /// Play, pause, seek.
+    Playback,
+    /// Skip directly (otherwise only vote).
+    Skip,
+}
+
+impl Perm {
+    pub const ALL: [Perm; 5] = [Perm::Listen, Perm::QueueAdd, Perm::QueueManage, Perm::Playback, Perm::Skip];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Perm::Listen => "Écoute",
+            Perm::QueueAdd => "Ajout",
+            Perm::QueueManage => "File",
+            Perm::Playback => "Lecture",
+            Perm::Skip => "Skip",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Permissions {
+    pub listen: bool,
+    pub queue_add: bool,
+    pub queue_manage: bool,
+    pub playback: bool,
+    pub skip: bool,
+}
+
+impl Permissions {
+    pub const NONE: Permissions =
+        Permissions { listen: false, queue_add: false, queue_manage: false, playback: false, skip: false };
+
+    pub fn get(&self, perm: Perm) -> bool {
+        match perm {
+            Perm::Listen => self.listen,
+            Perm::QueueAdd => self.queue_add,
+            Perm::QueueManage => self.queue_manage,
+            Perm::Playback => self.playback,
+            Perm::Skip => self.skip,
+        }
+    }
+
+    pub fn set(&mut self, perm: Perm, value: bool) {
+        let slot = match perm {
+            Perm::Listen => &mut self.listen,
+            Perm::QueueAdd => &mut self.queue_add,
+            Perm::QueueManage => &mut self.queue_manage,
+            Perm::Playback => &mut self.playback,
+            Perm::Skip => &mut self.skip,
+        };
+        *slot = value;
+    }
+
+    /// Role defaults with per-member overrides applied.
+    pub fn effective(role: Role, overrides: &Overrides) -> Self {
+        let mut p = role.defaults();
+        if role != Role::Host {
+            for (perm, value) in overrides {
+                p.set(*perm, *value);
+            }
+        }
+        p
+    }
+}
+
+/// Per-member exceptions to the role defaults.
+pub type Overrides = BTreeMap<Perm, bool>;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Member {
     pub id: MemberId,
     pub name: String,
     pub role: Role,
+    /// Effective permissions (role defaults + overrides).
+    pub perms: Permissions,
+    #[serde(default)]
+    pub overrides: Overrides,
+    /// In the waiting room, not admitted yet (only the host sees them).
+    #[serde(default)]
+    pub pending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoomSettings {
+    pub code: String,
+    pub waiting_room: bool,
+    pub default_role: Role,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoomSnapshot {
-    pub code: String,
+    pub settings: RoomSettings,
     pub playback: Playback,
     pub queue: Vec<QueueItem>,
     pub members: Vec<Member>,
@@ -152,6 +316,7 @@ mod tests {
                 cover_url: None,
             },
             added_by: "a".into(),
+            added_by_id: 1,
         }
     }
 
@@ -162,7 +327,23 @@ mod tests {
         let json = serde_json::to_string(&ClientMsg::Skip).unwrap();
         assert_eq!(json, r#"{"type":"skip"}"#);
         let back: ClientMsg = serde_json::from_str(r#"{"type":"join","data":{"version":1,"code":"ABC","name":"n"}}"#).unwrap();
-        assert!(matches!(back, ClientMsg::Join { host_token: None, .. }));
+        assert!(matches!(back, ClientMsg::Join { host_token: None, spotify_id: None, .. }));
+        let json = serde_json::to_string(&ClientMsg::Admin(AdminCmd::SetPerm { member: 2, perm: Perm::Skip, value: Some(true) })).unwrap();
+        assert_eq!(json, r#"{"type":"admin","data":{"action":"set_perm","member":2,"perm":"skip","value":true}}"#);
+    }
+
+    #[test]
+    fn overrides_apply_except_for_host() {
+        let mut o = Overrides::new();
+        o.insert(Perm::QueueAdd, false);
+        o.insert(Perm::Skip, true);
+        let p = Permissions::effective(Role::Listener, &o);
+        assert!(p.listen && !p.queue_add && p.skip && !p.playback);
+        assert_eq!(Permissions::effective(Role::Host, &o), Role::Host.defaults());
+        assert_eq!(Role::Spectator.defaults(), Permissions::NONE);
+        // Overrides survive a JSON round trip with enum keys.
+        let back: Overrides = serde_json::from_str(&serde_json::to_string(&o).unwrap()).unwrap();
+        assert_eq!(back, o);
     }
 
     #[test]

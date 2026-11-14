@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use client::{Event, SyncEvent};
 use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use image::DynamicImage;
-use protocol::{ClientMsg, Member, MemberId, Playback, QueueItem, Role, ServerMsg};
+use protocol::{AdminCmd, ClientMsg, Member, MemberId, Perm, Permissions, Playback, QueueItem, Role, RoomSettings, ServerMsg};
 use ratatui::layout::{Position, Rect};
 use ratatui::widgets::{ListState, TableState};
 use spotify::models::Track;
@@ -71,6 +71,24 @@ pub struct Areas {
     pub search: Rect,
     pub search_input: Rect,
     pub results_rows: Rect,
+    /// Permissions popup: whole popup, member rows, and the x span of each
+    /// column (role, then one per permission).
+    pub perm_popup: Rect,
+    pub perm_rows: Rect,
+    pub perm_cols: [(u16, u16); PERM_COLUMNS],
+}
+
+/// Role column + one column per permission.
+pub const PERM_COLUMNS: usize = 1 + Perm::ALL.len();
+
+/// Host's permissions popup (`p`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PermPanel {
+    pub row: usize,
+    /// 0 = role, 1.. = `Perm::ALL[col - 1]`
+    pub col: usize,
+    /// Ban asked once; a second `b` on the same member confirms.
+    pub confirm_ban: Option<MemberId>,
 }
 
 #[derive(Debug, Default)]
@@ -100,7 +118,10 @@ pub struct CoverCache {
 }
 
 pub struct App {
-    pub code: String,
+    pub settings: RoomSettings,
+    /// Skip votes: (votes, needed).
+    pub votes: (u32, u32),
+    pub perm_panel: Option<PermPanel>,
     pub me: MemberId,
     pub playback: Playback,
     pub queue: Vec<QueueItem>,
@@ -131,7 +152,9 @@ impl App {
     pub fn new(joined: &client::Joined, can_play: bool, theme: Theme) -> Self {
         let room = &joined.room;
         let mut app = Self {
-            code: room.code.clone(),
+            settings: room.settings.clone(),
+            votes: (0, 0),
+            perm_panel: None,
             me: joined.member_id,
             playback: room.playback.clone(),
             queue: room.queue.clone(),
@@ -172,6 +195,27 @@ impl App {
 
     pub fn is_host(&self) -> bool {
         self.me().is_some_and(|m| m.role == Role::Host)
+    }
+
+    pub fn my_perms(&self) -> Permissions {
+        self.me().map(|m| m.perms).unwrap_or(Permissions::NONE)
+    }
+
+    /// Checks a permission locally (the server enforces it anyway) so the
+    /// user gets a clear message instead of a refused command.
+    fn allowed(&mut self, ok: bool, what: &str) -> bool {
+        if !ok {
+            let role = self.me().map(|m| m.role.label()).unwrap_or("?");
+            self.toast(format!("Ton rôle ({role}) ne permet pas de {what}"), Level::Warn);
+        }
+        ok
+    }
+
+    /// Members shown in the permissions popup, in display order.
+    pub fn panel_members(&self) -> Vec<&Member> {
+        let mut members: Vec<&Member> = self.members.iter().collect();
+        members.sort_by_key(|m| (m.pending, m.role, m.id));
+        members
     }
 
     pub fn server_now(&self) -> u64 {
@@ -230,14 +274,31 @@ impl App {
             }
             ServerMsg::Members { members } => {
                 let newcomer = members.iter().find(|m| !self.members.iter().any(|o| o.id == m.id));
-                if let Some(text) = newcomer.map(|m| format!("{} a rejoint le salon", m.name)) {
-                    self.toast(text, Level::Info);
-                }
+                let text = match newcomer {
+                    Some(m) if m.pending && self.is_host() => {
+                        Some((format!("{} attend d'être admis (p puis a)", m.name), Level::Warn))
+                    }
+                    Some(m) if !m.pending => Some((format!("{} a rejoint le salon", m.name), Level::Info)),
+                    _ => None,
+                };
+                let my_role = self.me().map(|m| m.role);
                 self.members = members;
+                if let Some(new_role) = self.me().map(|m| m.role).filter(|r| Some(*r) != my_role && my_role.is_some()) {
+                    self.toast(format!("Ton rôle est maintenant : {}", new_role.label()), Level::Info);
+                } else if let Some((text, level)) = text {
+                    self.toast(text, level);
+                }
                 self.clamp_selections();
             }
+            ServerMsg::Settings(settings) => {
+                if settings.code != self.settings.code {
+                    self.toast(format!("Nouveau code du salon : {}", settings.code), Level::Info);
+                }
+                self.settings = settings;
+            }
+            ServerMsg::SkipVotes { votes, needed } => self.votes = (votes, needed),
             ServerMsg::Error { message, .. } => self.toast(message, Level::Bad),
-            ServerMsg::Welcome { .. } | ServerMsg::Pong { .. } => {}
+            ServerMsg::Welcome { .. } | ServerMsg::Pong { .. } | ServerMsg::Waiting => {}
         }
         vec![]
     }
@@ -249,6 +310,7 @@ impl App {
                 self.sync = (format!("dérive {:+.1} s corrigée", drift_ms as f64 / 1000.0), Level::Warn);
             }
             SyncEvent::Resynced { reason } => self.sync = (format!("resynchro : {reason}"), Level::Warn),
+            SyncEvent::Stopped => self.sync = ("écoute désactivée par l'hôte".into(), Level::Warn),
             SyncEvent::DeviceSelected { name } => self.toast(format!("Appareil Spotify : {name}"), Level::Info),
             SyncEvent::Error(err) => self.sync = (err, Level::Bad),
         }
@@ -306,6 +368,9 @@ impl App {
             self.show_help = false;
             return vec![];
         }
+        if self.perm_panel.is_some() {
+            return self.on_perm_key(key);
+        }
         if self.focus == Focus::Search && self.search.editing {
             return self.on_search_key(key);
         }
@@ -320,7 +385,14 @@ impl App {
             }
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char(' ') => return self.toggle_play(),
-            KeyCode::Char('s') => return vec![Effect::Send(ClientMsg::Skip)],
+            KeyCode::Char('s') => return self.skip_or_vote(),
+            KeyCode::Char('p') => {
+                if self.is_host() {
+                    self.perm_panel = Some(PermPanel::default());
+                } else {
+                    self.toast("Le panneau des permissions est réservé à l'hôte", Level::Warn);
+                }
+            }
             KeyCode::Char('r') => {
                 self.sync = ("resynchro demandée".into(), Level::Info);
                 return vec![Effect::Resync];
@@ -345,7 +417,10 @@ impl App {
                 KeyCode::Char('J') => return self.move_selected(1),
                 KeyCode::Char('d') | KeyCode::Delete => {
                     if let Some(item) = self.queue_state.selected().and_then(|i| self.queue.get(i)) {
-                        return vec![Effect::Send(ClientMsg::QueueRemove { id: item.id })];
+                        let (id, own) = (item.id, item.added_by_id == self.me);
+                        if self.allowed(own || self.my_perms().queue_manage, "retirer les morceaux des autres") {
+                            return vec![Effect::Send(ClientMsg::QueueRemove { id })];
+                        }
                     }
                 }
                 _ => {}
@@ -399,6 +474,9 @@ impl App {
             }
             return vec![];
         }
+        if self.perm_panel.is_some() {
+            return self.on_perm_mouse(m);
+        }
         let a = self.areas;
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -409,7 +487,7 @@ impl App {
                     return self.toggle_play();
                 }
                 if a.next_button.contains(pos) {
-                    return vec![Effect::Send(ClientMsg::Skip)];
+                    return self.skip_or_vote();
                 }
                 if a.progress.contains(pos) && a.progress.width > 0 {
                     if let Some(item) = &self.playback.current {
@@ -421,7 +499,8 @@ impl App {
                 if let Some(i) = row_index(a.queue_rows, pos, self.queue_state.offset(), self.queue.len()) {
                     self.focus = Focus::Queue;
                     self.queue_state.select(Some(i));
-                    self.drag_from = Some(i);
+                    // Only members who may reorder can drag.
+                    self.drag_from = self.my_perms().queue_manage.then_some(i);
                     return vec![];
                 }
                 if let Some(i) = row_index(a.results_rows, pos, self.search.state.offset(), self.search.results.len()) {
@@ -484,12 +563,15 @@ impl App {
     // -------------------------------------------------------- actions
 
     fn toggle_play(&mut self) -> Vec<Effect> {
+        if !self.allowed(self.my_perms().playback, "contrôler la lecture") {
+            return vec![];
+        }
         let msg = if self.playback.is_playing { ClientMsg::Pause } else { ClientMsg::Play };
         vec![Effect::Send(msg)]
     }
 
     fn seek_to(&mut self, position_ms: u64) -> Vec<Effect> {
-        if self.playback.current.is_none() {
+        if self.playback.current.is_none() || !self.allowed(self.my_perms().playback, "contrôler la lecture") {
             return vec![];
         }
         vec![Effect::Send(ClientMsg::Seek { position_ms })]
@@ -500,7 +582,23 @@ impl App {
         self.seek_to(target)
     }
 
+    /// Direct skip with the permission, otherwise a vote.
+    fn skip_or_vote(&mut self) -> Vec<Effect> {
+        let perms = self.my_perms();
+        if perms.skip {
+            return vec![Effect::Send(ClientMsg::Skip)];
+        }
+        if !self.allowed(perms.listen, "voter pour passer le morceau") || self.playback.current.is_none() {
+            return vec![];
+        }
+        self.toast("Vote pour passer le morceau enregistré", Level::Info);
+        vec![Effect::Send(ClientMsg::VoteSkip)]
+    }
+
     fn move_selected(&mut self, delta: isize) -> Vec<Effect> {
+        if !self.allowed(self.my_perms().queue_manage, "réordonner la file") {
+            return vec![];
+        }
         let Some(from) = self.queue_state.selected() else { return vec![] };
         let to = from.saturating_add_signed(delta).min(self.queue.len().saturating_sub(1));
         if to == from { vec![] } else { self.move_item(from, to) }
@@ -547,6 +645,9 @@ impl App {
     }
 
     fn add_selected_result(&mut self) -> Vec<Effect> {
+        if !self.allowed(self.my_perms().queue_add, "ajouter des morceaux") {
+            return vec![];
+        }
         let Some(track) = self.search.state.selected().and_then(|i| self.search.results.get(i)) else {
             return vec![];
         };
@@ -556,7 +657,129 @@ impl App {
         vec![Effect::Send(msg)]
     }
 
+    // ------------------------------------------------- permissions popup
+
+    fn on_perm_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        let rows = self.panel_members().len();
+        let Some(panel) = self.perm_panel.as_mut() else { return vec![] };
+        if key.code != KeyCode::Char('b') {
+            panel.confirm_ban = None;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('p') | KeyCode::Char('q') => self.perm_panel = None,
+            KeyCode::Up | KeyCode::Char('k') => panel.row = panel.row.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => panel.row = (panel.row + 1).min(rows.saturating_sub(1)),
+            KeyCode::Left | KeyCode::Char('h') => panel.col = panel.col.saturating_sub(1),
+            KeyCode::Right | KeyCode::Char('l') => panel.col = (panel.col + 1).min(PERM_COLUMNS - 1),
+            KeyCode::Char(' ') | KeyCode::Enter => return self.toggle_cell(),
+            KeyCode::Char('r') => return self.cycle_role(),
+            KeyCode::Char('x') => return self.reset_override(),
+            KeyCode::Char('a') => return self.admin_on_selected(|id| AdminCmd::Admit { member: id }),
+            KeyCode::Char('K') => return self.admin_on_selected(|id| AdminCmd::Kick { member: id }),
+            KeyCode::Char('b') => return self.ban_selected(),
+            KeyCode::Char('w') => {
+                return vec![Effect::Send(ClientMsg::Admin(AdminCmd::SetWaitingRoom { enabled: !self.settings.waiting_room }))];
+            }
+            KeyCode::Char('D') => {
+                let role = self.settings.default_role.next_assignable();
+                return vec![Effect::Send(ClientMsg::Admin(AdminCmd::SetDefaultRole { role }))];
+            }
+            KeyCode::Char('n') => return vec![Effect::Send(ClientMsg::Admin(AdminCmd::RotateCode))],
+            _ => {}
+        }
+        vec![]
+    }
+
+    fn on_perm_mouse(&mut self, m: MouseEvent) -> Vec<Effect> {
+        let pos = Position::new(m.column, m.row);
+        let a = self.areas;
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) if !a.perm_popup.contains(pos) => self.perm_panel = None,
+            MouseEventKind::Down(MouseButton::Left) => {
+                let rows = self.panel_members().len();
+                let Some(row) = row_index(a.perm_rows, pos, 0, rows) else { return vec![] };
+                let Some(col) = a.perm_cols.iter().position(|(x, w)| pos.x >= *x && pos.x < x + w) else {
+                    return vec![];
+                };
+                if let Some(panel) = self.perm_panel.as_mut() {
+                    panel.row = row;
+                    panel.col = col;
+                }
+                return self.toggle_cell();
+            }
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                let rows = self.panel_members().len();
+                if let Some(panel) = self.perm_panel.as_mut() {
+                    panel.row = if m.kind == MouseEventKind::ScrollDown {
+                        (panel.row + 1).min(rows.saturating_sub(1))
+                    } else {
+                        panel.row.saturating_sub(1)
+                    };
+                }
+            }
+            _ => {}
+        }
+        vec![]
+    }
+
+    /// Member under the popup cursor, unless it is the host (read-only row).
+    fn selected_target(&mut self) -> Option<Member> {
+        let row = self.perm_panel.as_ref()?.row;
+        let member = self.panel_members().get(row).map(|m| (*m).clone())?;
+        if member.role == Role::Host {
+            self.toast("L'hôte a tous les droits", Level::Info);
+            return None;
+        }
+        Some(member)
+    }
+
+    fn toggle_cell(&mut self) -> Vec<Effect> {
+        let col = self.perm_panel.as_ref().map_or(0, |p| p.col);
+        if col == 0 {
+            return self.cycle_role();
+        }
+        let Some(member) = self.selected_target() else { return vec![] };
+        let perm = Perm::ALL[col - 1];
+        let value = Some(!member.perms.get(perm));
+        vec![Effect::Send(ClientMsg::Admin(AdminCmd::SetPerm { member: member.id, perm, value }))]
+    }
+
+    fn cycle_role(&mut self) -> Vec<Effect> {
+        let Some(member) = self.selected_target() else { return vec![] };
+        let role = member.role.next_assignable();
+        vec![Effect::Send(ClientMsg::Admin(AdminCmd::SetRole { member: member.id, role }))]
+    }
+
+    fn reset_override(&mut self) -> Vec<Effect> {
+        let col = self.perm_panel.as_ref().map_or(0, |p| p.col);
+        let Some(member) = self.selected_target().filter(|_| col > 0) else { return vec![] };
+        let perm = Perm::ALL[col - 1];
+        vec![Effect::Send(ClientMsg::Admin(AdminCmd::SetPerm { member: member.id, perm, value: None }))]
+    }
+
+    fn admin_on_selected(&mut self, cmd: impl FnOnce(MemberId) -> AdminCmd) -> Vec<Effect> {
+        let Some(member) = self.selected_target() else { return vec![] };
+        vec![Effect::Send(ClientMsg::Admin(cmd(member.id)))]
+    }
+
+    fn ban_selected(&mut self) -> Vec<Effect> {
+        let Some(member) = self.selected_target() else { return vec![] };
+        let confirmed = self.perm_panel.as_ref().and_then(|p| p.confirm_ban) == Some(member.id);
+        if let Some(panel) = self.perm_panel.as_mut() {
+            panel.confirm_ban = if confirmed { None } else { Some(member.id) };
+        }
+        if confirmed {
+            return vec![Effect::Send(ClientMsg::Admin(AdminCmd::Ban { member: member.id }))];
+        }
+        self.toast(format!("Appuie encore sur b pour bannir {}", member.name), Level::Warn);
+        vec![]
+    }
+
     fn clamp_selections(&mut self) {
+        let rows = self.panel_members().len();
+        if let Some(panel) = self.perm_panel.as_mut() {
+            panel.row = panel.row.min(rows.saturating_sub(1));
+        }
         clamp(&mut self.queue_state, self.queue.len());
         let sel = self.members_state.selected();
         let len = self.members.len();
@@ -610,6 +833,10 @@ mod tests {
     use super::*;
     use protocol::{RoomSnapshot, TrackInfo};
 
+    fn member(id: MemberId, name: &str, role: Role) -> Member {
+        Member { id, name: name.into(), role, perms: role.defaults(), overrides: Default::default(), pending: false }
+    }
+
     fn item(id: u64) -> QueueItem {
         QueueItem {
             id,
@@ -622,6 +849,7 @@ mod tests {
                 cover_url: Some(format!("https://i.scdn.co/image/{id}")),
             },
             added_by: "Alex".into(),
+            added_by_id: 1,
         }
     }
 
@@ -631,10 +859,10 @@ mod tests {
         let joined = client::Joined {
             member_id: 1,
             room: RoomSnapshot {
-                code: "K7XQ2M".into(),
+                settings: RoomSettings { code: "K7XQ2M".into(), waiting_room: false, default_role: Role::Listener },
                 playback: Playback { seq: 1, current: Some(item(1)), position_ms: 0, server_ms: 0, is_playing: true },
                 queue: vec![item(2), item(3), item(4)],
-                members: vec![Member { id: 1, name: "Alex".into(), role: Role::Host }],
+                members: vec![member(1, "Alex", Role::Host), member(2, "Lou", Role::Listener)],
             },
             handle: client::RoomHandle::detached(),
             events,
@@ -728,7 +956,6 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let mut a = app();
-        a.members.push(Member { id: 2, name: "Sam".into(), role: Role::Listener });
         a.playback.position_ms = 61_000;
         a.playback.server_ms = a.server_now();
         a.playback.is_playing = true;
@@ -756,5 +983,78 @@ mod tests {
         // Clickable regions were recorded.
         assert!(a.areas.play_button.width == 6 && a.areas.progress.width > 20);
         assert!(a.areas.queue_rows.height >= 3);
+    }
+
+    #[test]
+    fn listener_actions_are_gated_and_skip_becomes_a_vote() {
+        let mut a = app();
+        a.me = 2; // Lou, listener
+        assert!(a.on_key(key(KeyCode::Char(' '))).is_empty());
+        assert!(a.active_toast().unwrap().0.contains("contrôler la lecture"));
+        assert_eq!(sent(&a.on_key(key(KeyCode::Char('s')))), [&ClientMsg::VoteSkip]);
+        assert!(a.on_key(key(KeyCode::Char('K'))).is_empty(), "no reordering");
+        // Queue items were added by Alex: Lou cannot remove them.
+        assert!(a.on_key(key(KeyCode::Char('d'))).is_empty());
+        assert!(a.on_key(key(KeyCode::Char('p'))).is_empty());
+        assert!(a.perm_panel.is_none());
+    }
+
+    #[test]
+    fn host_edits_permissions_from_the_panel() {
+        let mut a = app();
+        a.on_key(key(KeyCode::Char('p')));
+        assert!(a.perm_panel.is_some());
+        // Row 0 is the host: read-only.
+        assert!(a.on_key(key(KeyCode::Char(' '))).is_empty());
+        a.on_key(key(KeyCode::Down)); // Lou
+        assert_eq!(
+            sent(&a.on_key(key(KeyCode::Char(' ')))),
+            [&ClientMsg::Admin(AdminCmd::SetRole { member: 2, role: Role::Spectator })]
+        );
+        a.on_key(key(KeyCode::Right));
+        a.on_key(key(KeyCode::Right)); // "Ajout"
+        assert_eq!(
+            sent(&a.on_key(key(KeyCode::Enter))),
+            [&ClientMsg::Admin(AdminCmd::SetPerm { member: 2, perm: Perm::QueueAdd, value: Some(false) })]
+        );
+        assert_eq!(
+            sent(&a.on_key(key(KeyCode::Char('x')))),
+            [&ClientMsg::Admin(AdminCmd::SetPerm { member: 2, perm: Perm::QueueAdd, value: None })]
+        );
+        // Ban needs two presses.
+        assert!(a.on_key(key(KeyCode::Char('b'))).is_empty());
+        assert_eq!(sent(&a.on_key(key(KeyCode::Char('b')))), [&ClientMsg::Admin(AdminCmd::Ban { member: 2 })]);
+        a.on_key(key(KeyCode::Esc));
+        assert!(a.perm_panel.is_none());
+    }
+
+    #[test]
+    fn renders_permissions_panel_and_maps_clicks() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut a = app();
+        a.members[1].overrides.insert(Perm::QueueAdd, false);
+        a.members[1].perms.queue_add = false;
+        a.members.push(Member { pending: true, ..member(3, "Max", Role::Listener) });
+        a.on_key(key(KeyCode::Char('p')));
+        let mut terminal = Terminal::new(TestBackend::new(110, 34)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut a)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_owned()).collect::<String>() + "\n")
+            .collect();
+        println!("{text}");
+        for needle in ["Permissions · salon K7XQ2M", "Écoute", "[ ]*", "[v]", "en attente", "Salle d'attente : non"] {
+            assert!(text.contains(needle), "{needle} missing");
+        }
+        // Click Lou's "Skip" cell -> grant skip.
+        let row = a.areas.perm_rows.y + 1;
+        let (x, _) = a.areas.perm_cols[5];
+        let click = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: x + 1, row, modifiers: KeyModifiers::NONE };
+        assert_eq!(
+            sent(&a.on_mouse(click)),
+            [&ClientMsg::Admin(AdminCmd::SetPerm { member: 2, perm: Perm::Skip, value: Some(true) })]
+        );
     }
 }

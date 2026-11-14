@@ -9,19 +9,19 @@ use tokio::net::TcpListener;
 async fn start() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(server::serve(listener, "ABC234".into(), "tok".into()));
+    tokio::spawn(server::serve(listener, "ABC234".into(), "tok".into(), None));
     format!("ws://{addr}/ws")
 }
 
 fn opts(url: &str, code: &str) -> JoinOptions {
-    JoinOptions { ws_url: url.into(), code: code.into(), name: "Lou".into(), host_token: None }
+    JoinOptions { ws_url: url.into(), code: code.into(), name: "Lou".into(), host_token: Some("tok".into()), spotify_id: None, on_waiting: None }
 }
 
 #[tokio::test]
 async fn joins_and_receives_playback() {
     let url = start().await;
     let mut joined = join(opts(&url, "abc234"), None).await.unwrap();
-    assert_eq!(joined.room.code, "ABC234");
+    assert_eq!(joined.room.settings.code, "ABC234");
 
     let track = TrackInfo { uri: "spotify:track:1".into(), name: "T".into(), artists: "A".into(), duration_ms: 60_000, album_uri: None, cover_url: None };
     assert!(joined.handle.send(ClientMsg::QueueAdd { track }));
