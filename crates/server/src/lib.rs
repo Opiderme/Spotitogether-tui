@@ -58,9 +58,10 @@ enum Cmd {
         name: String,
         host_token: Option<String>,
         spotify_id: Option<String>,
+        session: Option<String>,
         ip: IpAddr,
         tx: mpsc::UnboundedSender<ServerMsg>,
-        reply: oneshot::Sender<Result<MemberId, (ErrorCode, String)>>,
+        reply: oneshot::Sender<Result<(MemberId, ConnId), (ErrorCode, String)>>,
     },
     Msg {
         from: MemberId,
@@ -68,8 +69,15 @@ enum Cmd {
     },
     Leave {
         id: MemberId,
+        conn: ConnId,
     },
 }
+
+/// Identifies one WebSocket connection: after a reconnection, the old
+/// connection closing must not mark the member offline again.
+type ConnId = u64;
+
+const EXPIRE_EVERY: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 struct AppState {
@@ -98,7 +106,9 @@ pub async fn serve(listener: TcpListener, code: String, host_token: String, stor
 /// Single task owning the room: applies commands in order and fires the
 /// end-of-track timer.
 async fn run_room(mut room: Room, mut rx: mpsc::UnboundedReceiver<Cmd>, shared_code: Arc<RwLock<String>>) {
-    let mut conns: HashMap<MemberId, mpsc::UnboundedSender<ServerMsg>> = HashMap::new();
+    let mut conns: HashMap<MemberId, (ConnId, mpsc::UnboundedSender<ServerMsg>)> = HashMap::new();
+    let mut next_conn: ConnId = 1;
+    let mut expire = tokio::time::interval(EXPIRE_EVERY);
     loop {
         // +5 ms so the timer never fires before the deadline (no busy loop).
         let deadline = room
@@ -110,17 +120,31 @@ async fn run_room(mut room: Room, mut rx: mpsc::UnboundedReceiver<Cmd>, shared_c
                 None => break,
             },
             _ = sleep_until(deadline) => None,
+            _ = expire.tick() => {
+                let outs = room.expire(now_ms());
+                dispatch(outs, &room, &mut conns);
+                continue;
+            }
         };
 
         let now = now_ms();
         let outs = match cmd {
             None => room.tick(now),
-            Some(Cmd::Join { name, host_token, spotify_id, ip, tx, reply }) => {
-                let request = JoinRequest { name: &name, host_token: host_token.as_deref(), spotify_id: spotify_id.as_deref(), ip };
+            Some(Cmd::Join { name, host_token, spotify_id, session, ip, tx, reply }) => {
+                let request = JoinRequest {
+                    name: &name,
+                    host_token: host_token.as_deref(),
+                    spotify_id: spotify_id.as_deref(),
+                    session: session.as_deref(),
+                    ip,
+                };
                 match room.join(request) {
                     Ok((id, outs)) => {
-                        conns.insert(id, tx);
-                        let _ = reply.send(Ok(id));
+                        let conn = next_conn;
+                        next_conn += 1;
+                        // A resumed session replaces any previous connection.
+                        conns.insert(id, (conn, tx));
+                        let _ = reply.send(Ok((id, conn)));
                         tracing::info!(id, name = room.member_name(id), "member joined");
                         outs
                     }
@@ -132,38 +156,44 @@ async fn run_room(mut room: Room, mut rx: mpsc::UnboundedReceiver<Cmd>, shared_c
                 }
             }
             Some(Cmd::Msg { from, msg }) => room.handle(from, msg, now),
-            Some(Cmd::Leave { id }) => {
+            Some(Cmd::Leave { id, conn }) => {
+                if conns.get(&id).map(|(c, _)| *c) != Some(conn) {
+                    continue; // stale connection of a resumed member
+                }
                 conns.remove(&id);
-                tracing::info!(id, "member left");
+                tracing::info!(id, "member disconnected");
                 room.leave(id, now)
             }
         };
-
-        for out in outs {
-            match out {
-                Out::All(msg) => {
-                    for (id, tx) in &conns {
-                        if room.is_admitted(*id) {
-                            let _ = tx.send(msg.clone());
-                        }
-                    }
-                }
-                Out::One(id, msg) => {
-                    if let Some(tx) = conns.get(&id) {
-                        let _ = tx.send(msg);
-                    }
-                }
-                // Dropping the sender ends the connection task once it has
-                // flushed what was already queued.
-                Out::Close(id) => {
-                    conns.remove(&id);
-                }
-            }
-        }
+        dispatch(outs, &room, &mut conns);
 
         if *shared_code.read().expect("lock") != room.code() {
             *shared_code.write().expect("lock") = room.code().to_owned();
             tracing::info!(code = room.code(), "invite code rotated");
+        }
+    }
+}
+
+fn dispatch(outs: Vec<Out>, room: &Room, conns: &mut HashMap<MemberId, (ConnId, mpsc::UnboundedSender<ServerMsg>)>) {
+    for out in outs {
+        match out {
+            Out::All(msg) => {
+                for (id, (_, tx)) in conns.iter() {
+                    if room.is_admitted(*id) {
+                        let _ = tx.send(msg.clone());
+                    }
+                }
+            }
+            Out::One(id, msg) => {
+                if let Some((_, tx)) = conns.get(&id) {
+                    let _ = tx.send(msg);
+                }
+            }
+            // Dropping the sender ends the connection task once it has
+            // flushed what was already queued.
+            Out::Close(id) => {
+                conns.remove(&id);
+            }
         }
     }
 }
@@ -219,8 +249,8 @@ impl AppState {
 }
 
 async fn handle_socket(mut socket: WebSocket, ip: IpAddr, state: AppState) {
-    let (name, host_token, spotify_id) = match tokio::time::timeout(JOIN_TIMEOUT, recv(&mut socket)).await {
-        Ok(Some(Ok(ClientMsg::Join { version, code, name, host_token, spotify_id }))) => {
+    let (name, host_token, spotify_id, session) = match tokio::time::timeout(JOIN_TIMEOUT, recv(&mut socket)).await {
+        Ok(Some(Ok(ClientMsg::Join { version, code, name, host_token, spotify_id, session }))) => {
             if version != PROTOCOL_VERSION {
                 let msg = format!("version de protocole {version} non supportée (serveur : {PROTOCOL_VERSION})");
                 return reject(socket, ErrorCode::BadVersion, &msg).await;
@@ -234,7 +264,7 @@ async fn handle_socket(mut socket: WebSocket, ip: IpAddr, state: AppState) {
                 tracing::warn!(%ip, "wrong room code");
                 return reject(socket, ErrorCode::BadCode, "code de salon incorrect").await;
             }
-            (name, host_token, spotify_id)
+            (name, host_token, spotify_id, session)
         }
         Ok(Some(_)) => return reject(socket, ErrorCode::NotJoined, "le premier message doit être join").await,
         _ => return,
@@ -242,11 +272,11 @@ async fn handle_socket(mut socket: WebSocket, ip: IpAddr, state: AppState) {
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (reply_tx, reply_rx) = oneshot::channel();
-    if state.room_tx.send(Cmd::Join { name, host_token, spotify_id, ip, tx, reply: reply_tx }).is_err() {
+    if state.room_tx.send(Cmd::Join { name, host_token, spotify_id, session, ip, tx, reply: reply_tx }).is_err() {
         return;
     }
-    let id = match reply_rx.await {
-        Ok(Ok(id)) => id,
+    let (id, conn) = match reply_rx.await {
+        Ok(Ok(joined)) => joined,
         Ok(Err((code, message))) => return reject(socket, code, &message).await,
         Err(_) => return,
     };
@@ -282,7 +312,7 @@ async fn handle_socket(mut socket: WebSocket, ip: IpAddr, state: AppState) {
             },
         }
     }
-    let _ = state.room_tx.send(Cmd::Leave { id });
+    let _ = state.room_tx.send(Cmd::Leave { id, conn });
 }
 
 #[cfg(test)]

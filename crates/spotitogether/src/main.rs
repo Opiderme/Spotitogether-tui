@@ -48,6 +48,13 @@ enum Command {
         /// Ne rien enregistrer sur disque
         #[arg(long, conflicts_with = "data")]
         ephemeral: bool,
+        /// Adresse publique à mettre dans l'invitation (ex. salon.exemple.fr ou
+        /// mon-pc.tailnet.ts.net:7420), si elle diffère de l'adresse locale
+        #[arg(long)]
+        public: Option<String>,
+        /// Le salon est derrière un reverse proxy HTTPS (invitation en wss://)
+        #[arg(long, requires = "public")]
+        tls: bool,
     },
     /// Rejoint un salon : spotitogether join spotitogether://hôte:port/CODE
     Join {
@@ -97,8 +104,8 @@ async fn run(cli: Cli) -> Result<()> {
             println!("Jeton Spotify supprimé.");
             Ok(())
         }
-        Command::Serve { port, bind, code, data, ephemeral } => {
-            room_cmd::serve(room_cmd::ServeArgs { port, bind, code, data, ephemeral }).await
+        Command::Serve { port, bind, code, data, ephemeral, public, tls } => {
+            room_cmd::serve(room_cmd::ServeArgs { port, bind, code, data, ephemeral, public, tls }).await
         }
         Command::Join { invite, code, name, host_token, guest, spectator, plain } => {
             room_cmd::join(room_cmd::JoinArgs { invite, code, name, host_token, guest, spectator, plain }).await

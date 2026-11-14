@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Spotitogether
+Comment=Écoute Spotify synchronisée entre amis
+Exec=spotitogether join %u
+Terminal=true
+Icon=audio-x-generic
+Categories=AudioVideo;Audio;Player;
+MimeType=x-scheme-handler/spotitogether;
+NoDisplay=true

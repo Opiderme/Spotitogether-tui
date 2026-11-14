@@ -4,7 +4,8 @@
 sur sa machine, les autres le rejoignent avec un code, et chacun entend la même
 musique sur son propre compte Spotify.
 
-> État : phase 4 (salon, synchro, interface TUI et permissions par rôle).
+> État : phase 5 (salon, synchro, TUI, permissions, reconnexion, autoplay,
+> MPRIS, accès Internet et paquets).
 
 ## Prérequis
 
@@ -15,8 +16,16 @@ musique sur son propre compte Spotify.
 ## Installation
 
 ```sh
-cargo install --path crates/spotitogether
+# Arch Linux (AUR) : depuis les sources, ou le binaire des releases GitHub
+paru -S spotitogether-git        # ou spotitogether-bin
+
+# Ailleurs
+cargo install --locked --git https://github.com/Opiderme/Spotitogether-tui spotitogether
 ```
+
+Le serveur seul existe aussi en image Docker (voir le `Dockerfile`) et en
+service utilisateur systemd (`systemctl --user enable --now spotitogether`).
+Les PKGBUILD sont dans `deploy/aur/`.
 
 ## Premiers pas
 
@@ -52,14 +61,20 @@ spotitogether join spotitogether://127.0.0.1:7420/K7XQ2M --guest --spectator --n
 | espace, `s`, ← → | lecture/pause du salon, morceau suivant, ±10 s |
 | `j` `k`, `J` `K`, `d` | sélection, déplacement et retrait dans la file |
 | `r` | resynchroniser ton Spotify |
-| `c` | pochette en ASCII ou en blocs colorés |
+| `c` | pochette en ASCII, en blocs colorés ou en vraie image (Sixel/Kitty) |
 | `p` | permissions des membres (hôte) |
+| `A` | playlist d'autoplay, jouée quand la file est vide (hôte) |
 | `?`, `q` | aide, quitter |
 
 À la souris : boutons, barre de progression (clic pour se déplacer), glisser une
 ligne de la file pour la déplacer, molette pour défiler. Les couleurs suivent le
 thème Caelestia s'il est présent (rechargé quand le fond d'écran change).
 `join --plain` garde l'ancien client en lignes de commande.
+
+Le morceau du salon apparaît aussi comme lecteur MPRIS « Spotitogether » : barre
+Caelestia, `playerctl` et touches multimédia (avec les droits de ton rôle). Si la
+connexion coupe, le client se reconnecte seul et retrouve sa place pendant
+2 minutes.
 
 Chacun entend la musique sur son propre compte ; une dérive de plus de 1,5 s est
 corrigée automatiquement.
@@ -81,6 +96,9 @@ nouveaux arrivants ou générer un nouveau code. Rôles, exceptions, bannis et
 réglages sont gardés dans `~/.local/share/spotitogether/room-<port>.sqlite`
 (`serve --ephemeral` pour ne rien enregistrer). Les droits sont vérifiés par le
 serveur, quel que soit le client utilisé.
+
+Pour inviter des amis hors de ton réseau (Tailscale, HTTPS avec Caddy,
+redirection de port), voir [`deploy/README.md`](deploy/README.md).
 
 Chaque utilisateur crée sa propre app sur le
 [dashboard Spotify](https://developer.spotify.com/dashboard) : depuis février 2026,

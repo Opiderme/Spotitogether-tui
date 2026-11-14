@@ -1,0 +1,27 @@
+# Maintainer: Opiderme <98979178+Opiderme@users.noreply.github.com>
+# Binaire publié par .github/workflows/release.yml lors d'un tag vX.Y.Z.
+# Après une release : mettre pkgver à jour puis `updpkgsums`.
+pkgname=spotitogether-bin
+_pkgname=spotitogether
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Écoute Spotify synchronisée entre amis, dans le terminal (TUI, binaire)"
+arch=('x86_64')
+url="https://github.com/Opiderme/Spotitogether-tui"
+license=('MIT')
+depends=('gcc-libs' 'glibc')
+optdepends=('caelestia-shell: couleurs du thème Caelestia'
+            'spotifyd: lecteur Spotify sans interface graphique')
+provides=("$_pkgname")
+conflicts=("$_pkgname" "$_pkgname-git")
+source=("$url/releases/download/v$pkgver/$_pkgname-$pkgver-x86_64-linux.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+  cd "$_pkgname-$pkgver-x86_64-linux"
+  install -Dm755 spotitogether "$pkgdir/usr/bin/spotitogether"
+  install -Dm644 spotitogether.service "$pkgdir/usr/lib/systemd/user/spotitogether.service"
+  install -Dm644 spotitogether.desktop "$pkgdir/usr/share/applications/spotitogether.desktop"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$_pkgname/README.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

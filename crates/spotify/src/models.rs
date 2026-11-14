@@ -117,6 +117,29 @@ pub struct Paging<T> {
     pub offset: u32,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ItemCount {
+    #[serde(default)]
+    pub total: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlaylistSummary {
+    pub id: String,
+    pub name: String,
+    /// `items` since February 2026, `tracks` before.
+    #[serde(default, alias = "tracks")]
+    pub items: ItemCount,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct PlaylistEntry {
+    /// `item` since February 2026, `track` before; null for unavailable
+    /// tracks. Episodes parse too and are filtered out by URI.
+    #[serde(default, alias = "track")]
+    pub item: Option<Track>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct SearchResponse {
     pub tracks: Paging<Track>,
@@ -135,6 +158,24 @@ mod tests {
             is_restricted: restricted,
             volume_percent: None,
         }
+    }
+
+    #[test]
+    fn parses_playlists_in_both_formats() {
+        let new: Paging<PlaylistSummary> =
+            serde_json::from_str(r#"{"items":[{"id":"p","name":"Soirée","items":{"total":42}}],"total":1}"#).unwrap();
+        assert_eq!(new.items[0].items.total, 42);
+        let old: PlaylistSummary = serde_json::from_str(r#"{"id":"p","name":"S","tracks":{"total":7}}"#).unwrap();
+        assert_eq!(old.items.total, 7);
+
+        let entries: Paging<PlaylistEntry> = serde_json::from_str(
+            r#"{"items":[{"item":{"uri":"spotify:track:a","name":"A","duration_ms":1}},
+                         {"track":{"uri":"spotify:track:b","name":"B","duration_ms":1}},
+                         {"item":null}],"total":3}"#,
+        )
+        .unwrap();
+        let uris: Vec<_> = entries.items.iter().filter_map(|e| e.item.as_ref().map(|t| t.uri.as_str())).collect();
+        assert_eq!(uris, ["spotify:track:a", "spotify:track:b"]);
     }
 
     #[test]

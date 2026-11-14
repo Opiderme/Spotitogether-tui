@@ -34,6 +34,10 @@ pub enum ClientMsg {
         /// Self-declared by the client: good enough among friends, not proof.
         #[serde(default)]
         spotify_id: Option<String>,
+        /// Session token from a previous `Welcome`: rejoining within the
+        /// grace period gives back the same member (role, own tracks).
+        #[serde(default)]
+        session: Option<String>,
     },
     /// Clock sync: `t0` is the client's wall clock in ms, echoed back.
     Ping { t0: u64 },
@@ -68,12 +72,21 @@ pub enum AdminCmd {
     SetDefaultRole { role: Role },
     /// Generates a new invite code (members already inside stay).
     RotateCode,
+    /// Tracks played at random when the queue is empty (read from a playlist
+    /// by the host's client). An empty list turns autoplay off.
+    SetAutoplay { name: String, tracks: Vec<TrackInfo> },
 }
+
+/// Maximum number of autoplay tracks kept by the server.
+pub const MAX_AUTOPLAY_TRACKS: usize = 500;
+
+/// `added_by` of tracks picked by autoplay.
+pub const AUTOPLAY_NAME: &str = "Autoplay";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ServerMsg {
-    Welcome { member_id: MemberId, room: RoomSnapshot },
+    Welcome { member_id: MemberId, session: String, room: RoomSnapshot },
     Pong { t0: u64, server_ms: u64 },
     Playback(Playback),
     Queue { items: Vec<QueueItem> },
@@ -283,6 +296,14 @@ pub struct Member {
     /// In the waiting room, not admitted yet (only the host sees them).
     #[serde(default)]
     pub pending: bool,
+    /// False while the member's connection is lost (their place is kept for
+    /// a short grace period).
+    #[serde(default = "online_default")]
+    pub online: bool,
+}
+
+fn online_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -290,6 +311,9 @@ pub struct RoomSettings {
     pub code: String,
     pub waiting_room: bool,
     pub default_role: Role,
+    /// Name of the autoplay playlist, if any.
+    #[serde(default)]
+    pub autoplay: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -327,7 +351,7 @@ mod tests {
         let json = serde_json::to_string(&ClientMsg::Skip).unwrap();
         assert_eq!(json, r#"{"type":"skip"}"#);
         let back: ClientMsg = serde_json::from_str(r#"{"type":"join","data":{"version":1,"code":"ABC","name":"n"}}"#).unwrap();
-        assert!(matches!(back, ClientMsg::Join { host_token: None, spotify_id: None, .. }));
+        assert!(matches!(back, ClientMsg::Join { host_token: None, spotify_id: None, session: None, .. }));
         let json = serde_json::to_string(&ClientMsg::Admin(AdminCmd::SetPerm { member: 2, perm: Perm::Skip, value: Some(true) })).unwrap();
         assert_eq!(json, r#"{"type":"admin","data":{"action":"set_perm","member":2,"perm":"skip","value":true}}"#);
     }

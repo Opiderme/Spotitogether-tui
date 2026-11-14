@@ -9,6 +9,7 @@ use image::{DynamicImage, GenericImageView, Rgba};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
+use ratatui_image::picker::{Picker, ProtocolType};
 
 /// Density ramp, light to dense.
 const RAMP: &[u8] = b" .:-=+*#%@";
@@ -19,13 +20,18 @@ pub enum CoverMode {
     Ascii,
     /// Upper half block: two pixels per cell (foreground + background).
     Blocks,
+    /// The real picture through the terminal's graphics protocol (Sixel in
+    /// foot, Kitty, iTerm2), when the terminal supports one.
+    Image,
 }
 
 impl CoverMode {
-    pub fn next(self) -> Self {
+    /// Next mode; `Image` only when the terminal can display pictures.
+    pub fn next(self, images: bool) -> Self {
         match self {
             Self::Ascii => Self::Blocks,
-            Self::Blocks => Self::Ascii,
+            Self::Blocks if images => Self::Image,
+            Self::Blocks | Self::Image => Self::Ascii,
         }
     }
 
@@ -33,6 +39,7 @@ impl CoverMode {
         match self {
             Self::Ascii => "ascii",
             Self::Blocks => "blocs",
+            Self::Image => "image",
         }
     }
 }
@@ -52,7 +59,8 @@ pub fn render(img: &DynamicImage, width: u16, height: u16, mode: CoverMode) -> V
     }
     let (w, h) = (u32::from(width), u32::from(height));
     match mode {
-        CoverMode::Ascii => {
+        // Drawn by the graphics protocol; characters are the fallback.
+        CoverMode::Ascii | CoverMode::Image => {
             let small = img.resize_exact(w, h, FilterType::Triangle);
             (0..h)
                 .map(|y| {
@@ -105,6 +113,40 @@ pub fn draw(cells: &[Vec<Cell>], area: Rect, buf: &mut Buffer) {
             }
         }
     }
+}
+
+/// Graphics protocol from the environment, without querying the terminal:
+/// a query that gets no answer leaves a thread reading stdin, which then
+/// swallows key presses.
+pub fn graphics_protocol(term: &str, term_program: &str, kitty_window: bool) -> Option<ProtocolType> {
+    match (term, term_program) {
+        _ if kitty_window || term == "xterm-kitty" || term == "xterm-ghostty" => Some(ProtocolType::Kitty),
+        (t, _) if t.starts_with("foot") => Some(ProtocolType::Sixel),
+        (_, "WezTerm" | "iTerm.app") => Some(ProtocolType::Iterm2),
+        _ => None,
+    }
+}
+
+/// Picker for the current terminal, if it can display pictures. The cell
+/// size in pixels comes from the window-size ioctl.
+pub fn image_picker() -> Option<Picker> {
+    let env = |k: &str| std::env::var(k).unwrap_or_default();
+    // tmux and screen do not pass pictures through reliably.
+    if !env("TMUX").is_empty() || env("TERM").starts_with("screen") {
+        return None;
+    }
+    let protocol = graphics_protocol(&env("TERM"), &env("TERM_PROGRAM"), !env("KITTY_WINDOW_ID").is_empty())?;
+    let size = crossterm::terminal::window_size().ok()?;
+    if size.width == 0 || size.height == 0 || size.columns == 0 || size.rows == 0 {
+        return None;
+    }
+    let font = ratatui_image::FontSize { width: size.width / size.columns, height: size.height / size.rows };
+    // Deprecated in favour of `from_query_stdio`, which is exactly the
+    // stdin query avoided here (see above).
+    #[allow(deprecated)]
+    let mut picker = Picker::from_fontsize(font);
+    picker.set_protocol_type(protocol);
+    Some(picker)
 }
 
 fn cache_path(url: &str) -> Option<PathBuf> {
@@ -162,6 +204,22 @@ mod tests {
         let cells = render(&gradient(), 10, 5, CoverMode::Blocks);
         assert_eq!((cells.len(), cells[0].len()), (5, 10));
         assert!(cells.iter().flatten().all(|c| c.ch == '▀' && c.bg.is_some()));
+    }
+
+    #[test]
+    fn detects_graphics_protocol_from_environment() {
+        assert_eq!(graphics_protocol("foot", "", false), Some(ProtocolType::Sixel));
+        assert_eq!(graphics_protocol("foot-extra", "", false), Some(ProtocolType::Sixel));
+        assert_eq!(graphics_protocol("xterm-256color", "", true), Some(ProtocolType::Kitty));
+        assert_eq!(graphics_protocol("xterm-256color", "WezTerm", false), Some(ProtocolType::Iterm2));
+        assert_eq!(graphics_protocol("xterm-256color", "", false), None);
+    }
+
+    #[test]
+    fn image_mode_only_when_supported() {
+        assert_eq!(CoverMode::Blocks.next(false), CoverMode::Ascii);
+        assert_eq!(CoverMode::Blocks.next(true), CoverMode::Image);
+        assert_eq!(CoverMode::Image.next(true), CoverMode::Ascii);
     }
 
     #[test]

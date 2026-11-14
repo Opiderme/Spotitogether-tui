@@ -6,9 +6,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::IpAddr;
 
 use protocol::{
-    AdminCmd, ClientMsg, ErrorCode, ItemId, Member, MemberId, Overrides, Perm, Permissions, Playback, QueueItem,
-    Role, RoomSettings, RoomSnapshot, ServerMsg,
+    AUTOPLAY_NAME, AdminCmd, ClientMsg, ErrorCode, ItemId, MAX_AUTOPLAY_TRACKS, Member, MemberId, Overrides, Perm,
+    Permissions, Playback, QueueItem, Role, RoomSettings, RoomSnapshot, ServerMsg, TrackInfo,
 };
+use rand::seq::SliceRandom;
 
 use crate::store::{SavedMember, Store};
 
@@ -16,6 +17,8 @@ const MAX_NAME_LEN: usize = 32;
 const MAX_QUEUE_LEN: usize = 500;
 /// Pending tracks per member without `QueueManage`.
 pub const MAX_PENDING_PER_MEMBER: usize = 2;
+/// How long a disconnected member keeps their place (role, own tracks).
+pub const RECONNECT_GRACE_MS: u64 = 120_000;
 
 /// A message to deliver.
 #[derive(Debug, Clone, PartialEq)]
@@ -31,6 +34,7 @@ pub struct JoinRequest<'a> {
     pub name: &'a str,
     pub host_token: Option<&'a str>,
     pub spotify_id: Option<&'a str>,
+    pub session: Option<&'a str>,
     pub ip: IpAddr,
 }
 
@@ -38,6 +42,9 @@ struct MemberState {
     member: Member,
     spotify_id: Option<String>,
     ip: IpAddr,
+    session: String,
+    /// Server time at which the connection was lost.
+    offline_since: Option<u64>,
 }
 
 pub struct Room {
@@ -52,6 +59,9 @@ pub struct Room {
     /// `spotify:<id>` / `ip:<addr>` -> name
     bans: BTreeMap<String, String>,
     store: Option<Store>,
+    autoplay: Vec<TrackInfo>,
+    /// Indices of `autoplay` not played yet in this round (shuffled).
+    autoplay_bag: Vec<usize>,
     next_member: MemberId,
     next_item: ItemId,
 }
@@ -60,8 +70,10 @@ type Rejection = (ErrorCode, String);
 
 impl Room {
     pub fn new(code: impl Into<String>, host_token: impl Into<String>, now_ms: u64, store: Option<Store>) -> Self {
-        let mut settings = RoomSettings { code: code.into(), waiting_room: false, default_role: Role::Listener };
+        let mut settings =
+            RoomSettings { code: code.into(), waiting_room: false, default_role: Role::Listener, autoplay: None };
         let (mut saved, mut bans) = (HashMap::new(), BTreeMap::new());
+        let mut autoplay = Vec::new();
         if let Some(s) = &store {
             saved = s.members().unwrap_or_else(|e| warn_empty("members", e));
             bans = s.bans().unwrap_or_else(|e| warn_empty("bans", e));
@@ -72,6 +84,13 @@ impl Room {
                 && let Ok(role) = serde_json::from_str(&v)
             {
                 settings.default_role = role;
+            }
+            if let Ok(Some(v)) = s.setting("autoplay")
+                && let Ok((name, tracks)) = serde_json::from_str::<(String, Vec<TrackInfo>)>(&v)
+                && !tracks.is_empty()
+            {
+                settings.autoplay = Some(name);
+                autoplay = tracks;
             }
         }
         Self {
@@ -84,6 +103,8 @@ impl Room {
             saved,
             bans,
             store,
+            autoplay,
+            autoplay_bag: Vec::new(),
             next_member: 1,
             next_item: 1,
         }
@@ -118,6 +139,9 @@ impl Room {
         if !is_host && self.is_banned(req.spotify_id, req.ip) {
             return Err((ErrorCode::Banned, "tu es banni de ce salon".into()));
         }
+        if let Some(id) = req.session.and_then(|s| self.members.iter().find(|(_, m)| m.session == s).map(|(id, _)| *id)) {
+            return Ok((id, self.resume(id, req.ip)));
+        }
         let id = self.next_member;
         self.next_member += 1;
 
@@ -135,8 +159,16 @@ impl Room {
             perms: Permissions::effective(role, &overrides),
             overrides,
             pending,
+            online: true,
         };
-        self.members.insert(id, MemberState { member, spotify_id: req.spotify_id.map(str::to_owned), ip: req.ip });
+        let state = MemberState {
+            member,
+            spotify_id: req.spotify_id.map(str::to_owned),
+            ip: req.ip,
+            session: crate::generate_host_token(),
+            offline_since: None,
+        };
+        self.members.insert(id, state);
 
         let mut outs = vec![if pending { Out::One(id, ServerMsg::Waiting) } else { self.welcome(id) }];
         outs.push(self.members_msg());
@@ -146,7 +178,47 @@ impl Room {
         Ok((id, outs))
     }
 
+    /// Same member reconnecting with their session token.
+    fn resume(&mut self, id: MemberId, ip: IpAddr) -> Vec<Out> {
+        let state = self.members.get_mut(&id).expect("id from members");
+        state.offline_since = None;
+        state.member.online = true;
+        state.ip = ip;
+        let pending = state.member.pending;
+        let mut outs = vec![if pending { Out::One(id, ServerMsg::Waiting) } else { self.welcome(id) }, self.members_msg()];
+        if !pending {
+            outs.extend(self.votes_changed());
+        }
+        outs
+    }
+
+    /// Connection lost: the member stays (offline) for the grace period,
+    /// except in the waiting room where there is nothing to keep.
     pub fn leave(&mut self, id: MemberId, now_ms: u64) -> Vec<Out> {
+        let Some(state) = self.members.get_mut(&id) else { return vec![] };
+        if state.member.pending {
+            return self.remove(id, now_ms);
+        }
+        state.offline_since = Some(now_ms);
+        state.member.online = false;
+        self.skip_votes.remove(&id);
+        let mut outs = vec![self.members_msg()];
+        outs.extend(self.check_votes(now_ms));
+        outs
+    }
+
+    /// Removes members whose grace period is over.
+    pub fn expire(&mut self, now_ms: u64) -> Vec<Out> {
+        let expired: Vec<MemberId> = self
+            .members
+            .iter()
+            .filter(|(_, m)| m.offline_since.is_some_and(|t| now_ms >= t + RECONNECT_GRACE_MS))
+            .map(|(id, _)| *id)
+            .collect();
+        expired.into_iter().flat_map(|id| self.remove(id, now_ms)).collect()
+    }
+
+    fn remove(&mut self, id: MemberId, now_ms: u64) -> Vec<Out> {
         if self.members.remove(&id).is_none() {
             return vec![];
         }
@@ -157,7 +229,8 @@ impl Room {
     }
 
     fn welcome(&self, id: MemberId) -> Out {
-        Out::One(id, ServerMsg::Welcome { member_id: id, room: self.snapshot() })
+        let session = self.members[&id].session.clone();
+        Out::One(id, ServerMsg::Welcome { member_id: id, session, room: self.snapshot() })
     }
 
     fn is_banned(&self, spotify_id: Option<&str>, ip: IpAddr) -> bool {
@@ -349,7 +422,7 @@ impl Room {
                     (ErrorCode::Kicked, "l'hôte t'a exclu du salon")
                 };
                 let mut outs = vec![error(member, code, text), Out::Close(member)];
-                outs.extend(self.leave(member, now_ms));
+                outs.extend(self.remove(member, now_ms));
                 outs
             }
             AdminCmd::Admit { member } => match self.members.get_mut(&member) {
@@ -377,6 +450,21 @@ impl Room {
             AdminCmd::RotateCode => {
                 self.settings.code = crate::generate_code();
                 vec![self.settings_msg()]
+            }
+            AdminCmd::SetAutoplay { name, mut tracks } => {
+                tracks.retain(|t| t.uri.starts_with("spotify:track:") && t.duration_ms > 0);
+                tracks.truncate(MAX_AUTOPLAY_TRACKS);
+                self.settings.autoplay = (!tracks.is_empty()).then(|| name.clone());
+                let stored = if tracks.is_empty() { String::new() } else { serde_json::to_string(&(&name, &tracks)).expect("serializable") };
+                self.persist_setting("autoplay", &stored);
+                self.autoplay = tracks;
+                self.autoplay_bag.clear();
+                let mut outs = vec![self.settings_msg()];
+                // An idle room starts right away.
+                if self.playback.current.is_none() && !self.autoplay.is_empty() {
+                    outs.extend(self.advance(now_ms));
+                }
+                outs
             }
         }
     }
@@ -433,7 +521,7 @@ impl Room {
     fn eligible_voters(&self) -> BTreeSet<MemberId> {
         self.members
             .values()
-            .filter(|m| !m.member.pending && m.member.perms.listen)
+            .filter(|m| !m.member.pending && m.member.online && m.member.perms.listen)
             .map(|m| m.member.id)
             .collect()
     }
@@ -473,8 +561,24 @@ impl Room {
         vec![Out::All(ServerMsg::Playback(self.playback.clone()))]
     }
 
+    /// Next autoplay track: a shuffled round over the whole list, so nothing
+    /// repeats before every track was played.
+    fn next_autoplay(&mut self) -> Option<QueueItem> {
+        if self.autoplay.is_empty() {
+            return None;
+        }
+        if self.autoplay_bag.is_empty() {
+            self.autoplay_bag = (0..self.autoplay.len()).collect();
+            self.autoplay_bag.shuffle(&mut rand::rng());
+        }
+        let track = self.autoplay[self.autoplay_bag.pop()?].clone();
+        let id = self.next_item;
+        self.next_item += 1;
+        Some(QueueItem { id, track, added_by: AUTOPLAY_NAME.to_owned(), added_by_id: 0 })
+    }
+
     fn advance(&mut self, now_ms: u64) -> Vec<Out> {
-        let next = self.queue.pop_front();
+        let next = self.queue.pop_front().or_else(|| self.next_autoplay());
         let seq = self.playback.seq + 1;
         self.playback = Playback { seq, is_playing: next.is_some(), current: next, position_ms: 0, server_ms: now_ms };
         self.skip_votes.clear();
@@ -535,7 +639,7 @@ mod tests {
     }
 
     fn req<'a>(name: &'a str, token: Option<&'a str>, spotify_id: Option<&'a str>) -> JoinRequest<'a> {
-        JoinRequest { name, host_token: token, spotify_id, ip: LAN }
+        JoinRequest { name, host_token: token, spotify_id, session: None, ip: LAN }
     }
 
     fn room() -> (Room, MemberId) {
@@ -732,5 +836,65 @@ mod tests {
             r.handle(999, ClientMsg::Skip, 0).as_slice(),
             [Out::One(999, ServerMsg::Error { code: ErrorCode::NotJoined, .. })]
         ));
+    }
+
+    #[test]
+    fn disconnected_members_keep_their_place_during_the_grace_period() {
+        let (mut r, host) = room();
+        let lou = guest(&mut r, "Lou");
+        r.handle(host, ClientMsg::QueueAdd { track: track(1, 100_000) }, 0);
+        r.handle(lou, ClientMsg::QueueAdd { track: track(2, 1000) }, 0);
+        let session = match r.welcome(lou) {
+            Out::One(_, ServerMsg::Welcome { session, .. }) => session,
+            _ => unreachable!(),
+        };
+        r.leave(lou, 1_000);
+        assert!(!member(&r, lou).online);
+        assert!(r.expire(1_000 + RECONNECT_GRACE_MS - 1).is_empty());
+
+        // Back with the session: same id, own track still removable.
+        let (again, outs) = r.join(JoinRequest { session: Some(&session), ..req("Lou", None, Some("Lou")) }).unwrap();
+        assert_eq!(again, lou);
+        assert!(matches!(&outs[0], Out::One(id, ServerMsg::Welcome { .. }) if *id == lou));
+        assert!(member(&r, lou).online);
+        let item = r.snapshot().queue[0].id;
+        assert!(!forbidden(&r.handle(lou, ClientMsg::QueueRemove { id: item }, 2_000)));
+
+        // Gone for good after the grace period.
+        r.leave(lou, 3_000);
+        assert!(!r.expire(3_000 + RECONNECT_GRACE_MS).is_empty());
+        assert!(r.snapshot().members.iter().all(|m| m.id != lou));
+        let (fresh, _) = r.join(JoinRequest { session: Some(&session), ..req("Lou", None, Some("Lou")) }).unwrap();
+        assert_ne!(fresh, lou);
+    }
+
+    #[test]
+    fn autoplay_fills_an_empty_queue_without_repeats() {
+        let (mut r, host) = room();
+        let tracks: Vec<TrackInfo> = (1..=3).map(|n| track(n, 1000)).collect();
+        let outs = r.handle(host, ClientMsg::Admin(AdminCmd::SetAutoplay { name: "Ma playlist".into(), tracks }), 0);
+        assert!(matches!(&outs[0], Out::All(ServerMsg::Settings(s)) if s.autoplay.as_deref() == Some("Ma playlist")));
+        let first = playback(&outs).expect("idle room starts").current.clone().unwrap();
+        assert_eq!(first.added_by, AUTOPLAY_NAME);
+
+        // A queued track has priority over autoplay.
+        r.handle(host, ClientMsg::QueueAdd { track: track(9, 1000) }, 10);
+        assert_eq!(playback(&r.tick(1000)).unwrap().current.as_ref().unwrap().track.name, "T9");
+
+        let mut seen = vec![first.track.name];
+        for t in [2000, 3000] {
+            seen.push(playback(&r.tick(t)).unwrap().current.as_ref().unwrap().track.name.clone());
+        }
+        seen.sort();
+        assert_eq!(seen, ["T1", "T2", "T3"], "one full round before any repeat");
+
+        // Remembered by the store, turned off with an empty list.
+        let store = r.store.take().unwrap();
+        assert!(store.setting("autoplay").unwrap().unwrap().contains("Ma playlist"));
+        let mut r2 = Room::new("X", "secret", 0, Some(store));
+        let host2 = r2.join(req("Alex", Some("secret"), None)).unwrap().0;
+        assert_eq!(r2.snapshot().settings.autoplay.as_deref(), Some("Ma playlist"));
+        r2.handle(host2, ClientMsg::Admin(AdminCmd::SetAutoplay { name: String::new(), tracks: vec![] }), 0);
+        assert_eq!(r2.snapshot().settings.autoplay, None);
     }
 }

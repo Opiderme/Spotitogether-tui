@@ -1,0 +1,22 @@
+# Salon Spotitogether en service utilisateur systemd.
+#   cp deploy/spotitogether.service ~/.config/systemd/user/   (inutile avec le paquet AUR)
+#   systemctl --user edit spotitogether     # pour changer le code ou les options
+#   systemctl --user enable --now spotitogether
+#   journalctl --user -u spotitogether      # code d'invitation et jeton d'hôte
+#
+# Le jeton d'hôte est aussi écrit dans $XDG_RUNTIME_DIR/spotitogether/ : un
+# `spotitogether join spotitogether://127.0.0.1:7420/SALON1` sur cette machine
+# donne le rôle d'hôte.
+
+[Unit]
+Description=Salon Spotitogether
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/spotitogether serve --code SALON1
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

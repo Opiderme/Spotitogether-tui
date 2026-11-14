@@ -9,7 +9,7 @@ use image::DynamicImage;
 use protocol::{AdminCmd, ClientMsg, Member, MemberId, Perm, Permissions, Playback, QueueItem, Role, RoomSettings, ServerMsg};
 use ratatui::layout::{Position, Rect};
 use ratatui::widgets::{ListState, TableState};
-use spotify::models::Track;
+use spotify::models::{PlaylistSummary, Track};
 
 use crate::cover::{Cell, CoverMode};
 use crate::theme::Theme;
@@ -23,6 +23,8 @@ pub enum Effect {
     Send(ClientMsg),
     Search { request: u64, query: String, offset: u32 },
     FetchCover(String),
+    LoadPlaylists,
+    LoadPlaylistTracks { id: String, name: String },
     Resync,
     Quit,
 }
@@ -75,11 +77,21 @@ pub struct Areas {
     /// column (role, then one per permission).
     pub perm_popup: Rect,
     pub perm_rows: Rect,
+    pub picker_popup: Rect,
+    pub picker_rows: Rect,
     pub perm_cols: [(u16, u16); PERM_COLUMNS],
 }
 
 /// Role column + one column per permission.
 pub const PERM_COLUMNS: usize = 1 + Perm::ALL.len();
+
+/// Host's autoplay playlist picker (`A`).
+#[derive(Debug, Default)]
+pub struct PlaylistPicker {
+    pub loading: bool,
+    pub playlists: Vec<PlaylistSummary>,
+    pub state: ListState,
+}
 
 /// Host's permissions popup (`p`).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -122,6 +134,7 @@ pub struct App {
     /// Skip votes: (votes, needed).
     pub votes: (u32, u32),
     pub perm_panel: Option<PermPanel>,
+    pub playlist_picker: Option<PlaylistPicker>,
     pub me: MemberId,
     pub playback: Playback,
     pub queue: Vec<QueueItem>,
@@ -142,6 +155,10 @@ pub struct App {
     pub cover_mode: CoverMode,
     pub cover: Option<(String, DynamicImage)>,
     pub cover_cache: Option<CoverCache>,
+    /// Graphics protocol of the terminal (Sixel, Kitty…), if any.
+    pub image_picker: Option<ratatui_image::picker::Picker>,
+    /// Picture encoded for that protocol, for the current cover.
+    pub cover_image: Option<ratatui_image::protocol::StatefulProtocol>,
 
     pub theme: Theme,
     pub areas: Areas,
@@ -155,6 +172,7 @@ impl App {
             settings: room.settings.clone(),
             votes: (0, 0),
             perm_panel: None,
+            playlist_picker: None,
             me: joined.member_id,
             playback: room.playback.clone(),
             queue: room.queue.clone(),
@@ -176,6 +194,8 @@ impl App {
             cover_mode: CoverMode::Ascii,
             cover: None,
             cover_cache: None,
+            image_picker: None,
+            cover_image: None,
             theme,
             areas: Areas::default(),
             exit_message: None,
@@ -248,6 +268,10 @@ impl App {
             Event::Server(msg) => return self.on_server_msg(*msg),
             Event::Clock { offset_ms, .. } => self.clock_offset_ms = offset_ms,
             Event::Sync(e) => self.on_sync_event(e),
+            Event::Reconnecting { attempt, .. } => {
+                self.sync = (format!("connexion perdue, reconnexion… (essai {attempt})"), Level::Bad);
+            }
+            Event::Reconnected => self.toast("Reconnecté au salon", Level::Good),
             Event::Disconnected(reason) => {
                 self.exit_message = Some(reason);
                 return vec![Effect::Quit];
@@ -265,6 +289,7 @@ impl App {
                 if new_url != old_url {
                     self.cover = None;
                     self.cover_cache = None;
+                    self.cover_image = None;
                     return new_url.map(Effect::FetchCover).into_iter().collect();
                 }
             }
@@ -298,7 +323,17 @@ impl App {
             }
             ServerMsg::SkipVotes { votes, needed } => self.votes = (votes, needed),
             ServerMsg::Error { message, .. } => self.toast(message, Level::Bad),
-            ServerMsg::Welcome { .. } | ServerMsg::Pong { .. } | ServerMsg::Waiting => {}
+            // After a reconnection: fresh state from the server.
+            ServerMsg::Welcome { member_id, room, .. } => {
+                self.me = member_id;
+                self.settings = room.settings;
+                self.queue = room.queue;
+                self.members = room.members;
+                self.sync = ("synchro".into(), Level::Info);
+                self.clamp_selections();
+                return self.on_server_msg(ServerMsg::Playback(room.playback));
+            }
+            ServerMsg::Pong { .. } | ServerMsg::Waiting => {}
         }
         vec![]
     }
@@ -321,7 +356,10 @@ impl App {
             return; // the track changed meanwhile
         }
         match img {
-            Ok(img) => self.cover = Some((url, img)),
+            Ok(img) => {
+                self.cover_image = self.image_picker.as_ref().map(|p| p.new_resize_protocol(img.clone()));
+                self.cover = Some((url, img));
+            }
             Err(e) => tracing::warn!(%e, "cover download failed"),
         }
     }
@@ -371,6 +409,9 @@ impl App {
         if self.perm_panel.is_some() {
             return self.on_perm_key(key);
         }
+        if self.playlist_picker.is_some() {
+            return self.on_picker_key(key);
+        }
         if self.focus == Focus::Search && self.search.editing {
             return self.on_search_key(key);
         }
@@ -386,6 +427,16 @@ impl App {
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char(' ') => return self.toggle_play(),
             KeyCode::Char('s') => return self.skip_or_vote(),
+            KeyCode::Char('A') => {
+                if !self.is_host() {
+                    self.toast("L'autoplay est choisi par l'hôte", Level::Warn);
+                } else if !self.can_play {
+                    self.toast("L'autoplay nécessite ton compte Spotify (pas en mode spectateur)", Level::Warn);
+                } else {
+                    self.playlist_picker = Some(PlaylistPicker { loading: true, ..Default::default() });
+                    return vec![Effect::LoadPlaylists];
+                }
+            }
             KeyCode::Char('p') => {
                 if self.is_host() {
                     self.perm_panel = Some(PermPanel::default());
@@ -398,7 +449,7 @@ impl App {
                 return vec![Effect::Resync];
             }
             KeyCode::Char('c') => {
-                self.cover_mode = self.cover_mode.next();
+                self.cover_mode = self.cover_mode.next(self.image_picker.is_some());
                 self.toast(format!("Pochette : mode {}", self.cover_mode.label()), Level::Info);
             }
             KeyCode::Left => return self.seek_relative(-(SEEK_STEP_MS as i64)),
@@ -476,6 +527,9 @@ impl App {
         }
         if self.perm_panel.is_some() {
             return self.on_perm_mouse(m);
+        }
+        if self.playlist_picker.is_some() {
+            return self.on_picker_mouse(m);
         }
         let a = self.areas;
         match m.kind {
@@ -657,6 +711,102 @@ impl App {
         vec![Effect::Send(msg)]
     }
 
+    /// Media keys / `playerctl`, with the same permission checks.
+    pub fn on_mpris(&mut self, cmd: crate::mpris::Command) -> Vec<Effect> {
+        use crate::mpris::Command;
+        match cmd {
+            Command::PlayPause => self.toggle_play(),
+            Command::Play if !self.playback.is_playing => self.toggle_play(),
+            Command::Pause if self.playback.is_playing => self.toggle_play(),
+            Command::Play | Command::Pause => vec![],
+            Command::Next => self.skip_or_vote(),
+            Command::Seek(offset_ms) => self.seek_relative(offset_ms),
+            Command::SetPosition(ms) => self.seek_to(ms),
+        }
+    }
+
+    // ---------------------------------------------------- autoplay picker
+
+    pub fn on_playlists(&mut self, result: Result<Vec<PlaylistSummary>, String>) {
+        let Some(picker) = self.playlist_picker.as_mut() else { return };
+        picker.loading = false;
+        match result {
+            Ok(playlists) => {
+                picker.state.select((!playlists.is_empty()).then_some(0));
+                picker.playlists = playlists;
+            }
+            Err(e) => {
+                self.playlist_picker = None;
+                self.toast(format!("Playlists : {e}"), Level::Bad);
+            }
+        }
+    }
+
+    pub fn on_playlist_tracks(&mut self, name: String, result: Result<Vec<Track>, String>) -> Vec<Effect> {
+        match result {
+            Ok(tracks) if tracks.is_empty() => {
+                self.toast(format!("« {name} » ne contient aucun morceau jouable"), Level::Warn);
+                vec![]
+            }
+            Ok(tracks) => {
+                self.toast(format!("Autoplay : {name} ({} morceaux)", tracks.len()), Level::Good);
+                let tracks = tracks.iter().map(client::track_info).collect();
+                vec![Effect::Send(ClientMsg::Admin(AdminCmd::SetAutoplay { name, tracks }))]
+            }
+            Err(e) => {
+                self.toast(format!("Playlist « {name} » : {e}"), Level::Bad);
+                vec![]
+            }
+        }
+    }
+
+    fn on_picker_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        let Some(picker) = self.playlist_picker.as_mut() else { return vec![] };
+        let len = picker.playlists.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('A') | KeyCode::Char('q') => self.playlist_picker = None,
+            KeyCode::Up | KeyCode::Char('k') => select_prev_list(&mut picker.state, len),
+            KeyCode::Down | KeyCode::Char('j') => select_next_list(&mut picker.state, len),
+            KeyCode::Enter => return self.choose_playlist(),
+            KeyCode::Char('o') => {
+                self.playlist_picker = None;
+                self.toast("Autoplay désactivé", Level::Info);
+                let off = AdminCmd::SetAutoplay { name: String::new(), tracks: vec![] };
+                return vec![Effect::Send(ClientMsg::Admin(off))];
+            }
+            _ => {}
+        }
+        vec![]
+    }
+
+    fn on_picker_mouse(&mut self, m: MouseEvent) -> Vec<Effect> {
+        let pos = Position::new(m.column, m.row);
+        let a = self.areas;
+        let Some(picker) = self.playlist_picker.as_mut() else { return vec![] };
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) if !a.picker_popup.contains(pos) => self.playlist_picker = None,
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(i) = row_index(a.picker_rows, pos, picker.state.offset(), picker.playlists.len()) {
+                    if picker.state.selected() == Some(i) {
+                        return self.choose_playlist();
+                    }
+                    picker.state.select(Some(i));
+                }
+            }
+            MouseEventKind::ScrollDown => select_next_list(&mut picker.state, picker.playlists.len()),
+            MouseEventKind::ScrollUp => select_prev_list(&mut picker.state, picker.playlists.len()),
+            _ => {}
+        }
+        vec![]
+    }
+
+    fn choose_playlist(&mut self) -> Vec<Effect> {
+        let Some(picker) = self.playlist_picker.take() else { return vec![] };
+        let Some(p) = picker.state.selected().and_then(|i| picker.playlists.get(i)) else { return vec![] };
+        self.toast(format!("Chargement de « {} »…", p.name), Level::Info);
+        vec![Effect::LoadPlaylistTracks { id: p.id.clone(), name: p.name.clone() }]
+    }
+
     // ------------------------------------------------- permissions popup
 
     fn on_perm_key(&mut self, key: KeyEvent) -> Vec<Effect> {
@@ -834,7 +984,7 @@ mod tests {
     use protocol::{RoomSnapshot, TrackInfo};
 
     fn member(id: MemberId, name: &str, role: Role) -> Member {
-        Member { id, name: name.into(), role, perms: role.defaults(), overrides: Default::default(), pending: false }
+        Member { id, name: name.into(), role, perms: role.defaults(), overrides: Default::default(), pending: false, online: true }
     }
 
     fn item(id: u64) -> QueueItem {
@@ -859,7 +1009,7 @@ mod tests {
         let joined = client::Joined {
             member_id: 1,
             room: RoomSnapshot {
-                settings: RoomSettings { code: "K7XQ2M".into(), waiting_room: false, default_role: Role::Listener },
+                settings: RoomSettings { code: "K7XQ2M".into(), waiting_room: false, default_role: Role::Listener, autoplay: None },
                 playback: Playback { seq: 1, current: Some(item(1)), position_ms: 0, server_ms: 0, is_playing: true },
                 queue: vec![item(2), item(3), item(4)],
                 members: vec![member(1, "Alex", Role::Host), member(2, "Lou", Role::Listener)],
@@ -1056,5 +1206,49 @@ mod tests {
             sent(&a.on_mouse(click)),
             [&ClientMsg::Admin(AdminCmd::SetPerm { member: 2, perm: Perm::Skip, value: Some(true) })]
         );
+    }
+
+    #[test]
+    fn host_picks_an_autoplay_playlist() {
+        let mut a = app();
+        assert_eq!(a.on_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)), [Effect::LoadPlaylists]);
+        let playlist = |id: &str, name: &str| -> PlaylistSummary {
+            serde_json::from_value(serde_json::json!({"id": id, "name": name, "items": {"total": 3}})).unwrap()
+        };
+        a.on_playlists(Ok(vec![playlist("p1", "Soirée"), playlist("p2", "Chill")]));
+        a.on_key(key(KeyCode::Down));
+        assert_eq!(a.on_key(key(KeyCode::Enter)), [Effect::LoadPlaylistTracks { id: "p2".into(), name: "Chill".into() }]);
+        assert!(a.playlist_picker.is_none());
+        let track = Track { uri: "spotify:track:x".into(), name: "X".into(), duration_ms: 1000, ..Default::default() };
+        let fx = a.on_playlist_tracks("Chill".into(), Ok(vec![track]));
+        assert!(matches!(sent(&fx)[..], [ClientMsg::Admin(AdminCmd::SetAutoplay { name, tracks })] if name == "Chill" && tracks.len() == 1));
+
+        // Listeners cannot open it.
+        a.me = 2;
+        assert!(a.on_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)).is_empty());
+    }
+
+    #[test]
+    fn mpris_commands_and_diff() {
+        use crate::mpris::{Command, Shown, Update, diff};
+        let mut a = app();
+        assert_eq!(sent(&a.on_mpris(Command::PlayPause)), [&ClientMsg::Pause]);
+        assert!(a.on_mpris(Command::Play).is_empty(), "already playing");
+        assert_eq!(sent(&a.on_mpris(Command::Next)), [&ClientMsg::Skip]);
+
+        let mut shown = Shown::default();
+        let first = diff(&mut shown, &a);
+        assert!(matches!(&first[0], Update::Track { title, .. } if title == "T1"));
+        assert!(first.contains(&Update::Status { playing: true }));
+        assert!(diff(&mut shown, &a).is_empty(), "nothing changed");
+        a.playback.seq += 1;
+        a.playback.is_playing = false;
+        let next = diff(&mut shown, &a);
+        assert!(matches!(next[0], Update::Seeked(_)));
+        assert!(next.contains(&Update::Status { playing: false }));
+
+        a.me = 2; // listener: no playback control
+        assert!(a.on_mpris(Command::PlayPause).is_empty());
+        assert!(diff(&mut shown, &a).contains(&Update::Controls { playback: false, skip: true }));
     }
 }

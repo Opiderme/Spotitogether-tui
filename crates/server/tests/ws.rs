@@ -47,7 +47,7 @@ async fn wait_for(ws: &mut Ws, pred: impl Fn(&ServerMsg) -> bool) -> ServerMsg {
 async fn join(url: &str, code: &str, name: &str, host: bool) -> Ws {
     let (mut ws, _) = connect_async(url).await.unwrap();
     let host_token = host.then(|| "hosttoken".to_owned());
-    send(&mut ws, &ClientMsg::Join { version: PROTOCOL_VERSION, code: code.into(), name: name.into(), host_token, spotify_id: None }).await;
+    send(&mut ws, &ClientMsg::Join { version: PROTOCOL_VERSION, code: code.into(), name: name.into(), host_token, spotify_id: None, session: None }).await;
     ws
 }
 
@@ -87,9 +87,9 @@ async fn two_members_share_playback_and_track_ends() {
     assert_eq!(t0, 42);
     assert!(server_ms >= end.server_ms);
 
-    // Leaving updates the member list.
+    // Leaving marks the member offline (their place is kept for a while).
     sam.close(None).await.unwrap();
-    wait_for(&mut alex, |m| matches!(m, ServerMsg::Members { members } if members.len() == 1)).await;
+    wait_for(&mut alex, |m| matches!(m, ServerMsg::Members { members } if members.iter().any(|m| !m.online))).await;
 }
 
 #[tokio::test]
@@ -108,7 +108,7 @@ async fn wrong_codes_are_rejected_then_rate_limited() {
 async fn bad_version_is_rejected() {
     let url = start().await;
     let (mut ws, _) = connect_async(&url).await.unwrap();
-    send(&mut ws, &ClientMsg::Join { version: 999, code: "ABC234".into(), name: "x".into(), host_token: None, spotify_id: None }).await;
+    send(&mut ws, &ClientMsg::Join { version: 999, code: "ABC234".into(), name: "x".into(), host_token: None, spotify_id: None, session: None }).await;
     assert!(matches!(next(&mut ws).await, ServerMsg::Error { code: ErrorCode::BadVersion, .. }));
 }
 

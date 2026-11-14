@@ -21,6 +21,8 @@ pub use sync::SyncEvent;
 use sync::Syncer;
 
 const INVITE_SCHEME: &str = "spotitogether://";
+/// Room behind HTTPS (reverse proxy with a certificate): `wss://`, port 443.
+const INVITE_SCHEME_TLS: &str = "spotitogether+tls://";
 /// Quick pings right after joining, then a slow refresh.
 const INITIAL_PINGS: u32 = 5;
 const INITIAL_PING_EVERY: Duration = Duration::from_millis(200);
@@ -42,6 +44,7 @@ pub enum Error {
 }
 
 /// Parsed invite: `spotitogether://host[:port]/CODE`, `host[:port]/CODE`,
+/// `spotitogether+tls://host[:port]/CODE` (TLS, default port 443),
 /// or a raw `ws://` / `wss://` URL (code given separately).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Invite {
@@ -57,7 +60,10 @@ pub fn parse_invite(input: &str) -> Result<Invite, Error> {
         let ws_url = if has_path { base.to_owned() } else { format!("{base}{WS_PATH}") };
         return Ok(Invite { ws_url, code: None });
     }
-    let rest = input.strip_prefix(INVITE_SCHEME).unwrap_or(input);
+    let (rest, tls) = match input.strip_prefix(INVITE_SCHEME_TLS) {
+        Some(rest) => (rest, true),
+        None => (input.strip_prefix(INVITE_SCHEME).unwrap_or(input), false),
+    };
     let (host, code) = match rest.split_once('/') {
         Some((h, c)) => (h, Some(c.trim_matches('/')).filter(|c| !c.is_empty())),
         None => (rest, None),
@@ -65,8 +71,9 @@ pub fn parse_invite(input: &str) -> Result<Invite, Error> {
     if host.is_empty() || host.contains(char::is_whitespace) {
         return Err(Error::Invite(input.to_owned()));
     }
-    let host = if host.contains(':') { host.to_owned() } else { format!("{host}:{DEFAULT_PORT}") };
-    Ok(Invite { ws_url: format!("ws://{host}{WS_PATH}"), code: code.map(|c| c.to_uppercase()) })
+    let (scheme, default_port) = if tls { ("wss", 443) } else { ("ws", DEFAULT_PORT) };
+    let host = if host.contains(':') { host.to_owned() } else { format!("{host}:{default_port}") };
+    Ok(Invite { ws_url: format!("{scheme}://{host}{WS_PATH}"), code: code.map(|c| c.to_uppercase()) })
 }
 
 pub struct JoinOptions {
@@ -79,12 +86,27 @@ pub struct JoinOptions {
     pub on_waiting: Option<Box<dyn FnOnce() + Send>>,
 }
 
+/// What is needed to (re)connect.
+#[derive(Clone)]
+struct Credentials {
+    ws_url: String,
+    code: String,
+    name: String,
+    host_token: Option<String>,
+    spotify_id: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum Event {
     Server(Box<ServerMsg>),
     Sync(SyncEvent),
     /// New clock estimate: server time = local time + `offset_ms`.
     Clock { offset_ms: i64, rtt_ms: u64 },
+    /// Connection lost; retrying (the room keeps our place for a while).
+    Reconnecting { attempt: u32, reason: String },
+    /// Back in the room; a `Server(Welcome)` with the fresh state follows.
+    Reconnected,
+    /// Final: kicked, banned, or refused when reconnecting.
     Disconnected(String),
 }
 
@@ -136,25 +158,57 @@ pub struct Joined {
     pub events: mpsc::UnboundedReceiver<Event>,
 }
 
+struct Connected {
+    ws: Ws,
+    member_id: MemberId,
+    session: String,
+    room: RoomSnapshot,
+}
+
 /// Joins the room. Without `spotify` the client only watches (spectator).
 pub async fn join(opts: JoinOptions, spotify: Option<Arc<SpotifyClient>>) -> Result<Joined, Error> {
-    let (mut ws, _) = connect_async(opts.ws_url.as_str()).await?;
-    let join = ClientMsg::Join {
-        version: PROTOCOL_VERSION,
+    let creds = Credentials {
+        ws_url: opts.ws_url,
         code: opts.code,
         name: opts.name,
         host_token: opts.host_token,
         spotify_id: opts.spotify_id,
     };
     let mut on_waiting = opts.on_waiting;
-    ws.send(Message::text(serde_json::to_string(&join).expect("serializable"))).await?;
+    let conn = connect(&creds, None, &mut on_waiting).await?;
+    let (member_id, room) = (conn.member_id, conn.room.clone());
 
-    let (member_id, room) = loop {
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let can_listen = room.members.iter().find(|m| m.id == member_id).is_some_and(|m| m.perms.listen);
+    let listener = spotify.map(|sp| Listener { spotify: sp, member_id, can_listen });
+    tokio::spawn(run(conn, creds, cmd_rx, event_tx, listener));
+    Ok(Joined { member_id, room, handle: RoomHandle { tx: cmd_tx }, events: event_rx })
+}
+
+async fn connect(
+    creds: &Credentials,
+    session: Option<&str>,
+    on_waiting: &mut Option<Box<dyn FnOnce() + Send>>,
+) -> Result<Connected, Error> {
+    let (mut ws, _) = connect_async(creds.ws_url.as_str()).await?;
+    let join = ClientMsg::Join {
+        version: PROTOCOL_VERSION,
+        code: creds.code.clone(),
+        name: creds.name.clone(),
+        host_token: creds.host_token.clone(),
+        spotify_id: creds.spotify_id.clone(),
+        session: session.map(str::to_owned),
+    };
+    ws.send(Message::text(serde_json::to_string(&join).expect("serializable"))).await?;
+    loop {
         match ws.next().await {
             None => return Err(Error::Protocol("connexion fermée".into())),
             Some(Err(e)) => return Err(e.into()),
             Some(Ok(Message::Text(t))) => match serde_json::from_str::<ServerMsg>(t.as_str()) {
-                Ok(ServerMsg::Welcome { member_id, room }) => break (member_id, room),
+                Ok(ServerMsg::Welcome { member_id, session, room }) => {
+                    return Ok(Connected { ws, member_id, session, room });
+                }
                 Ok(ServerMsg::Waiting) => {
                     if let Some(f) = on_waiting.take() {
                         f();
@@ -166,14 +220,7 @@ pub async fn join(opts: JoinOptions, spotify: Option<Arc<SpotifyClient>>) -> Res
             },
             Some(Ok(_)) => continue,
         }
-    };
-
-    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
-    let can_listen = room.members.iter().find(|m| m.id == member_id).is_some_and(|m| m.perms.listen);
-    let spotify = spotify.map(|sp| Listener { spotify: sp, member_id, can_listen });
-    tokio::spawn(run(ws, cmd_rx, event_tx, room.playback.clone(), spotify));
-    Ok(Joined { member_id, room, handle: RoomHandle { tx: cmd_tx }, events: event_rx })
+    }
 }
 
 /// The local Spotify, played only while the member has the `Listen` permission.
@@ -185,46 +232,125 @@ struct Listener {
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// Why a connection ended.
+enum Ended {
+    /// Network problem or server restart: try to reconnect.
+    Lost(String),
+    /// Kicked or banned: do not come back.
+    Final(String),
+    /// The front-end dropped its handle (user quit).
+    Quit,
+}
+
+/// Delay before reconnection attempt `n` (1-based).
+pub fn reconnect_delay(attempt: u32) -> Duration {
+    const STEPS: [u64; 5] = [1, 2, 3, 5, 10];
+    Duration::from_secs(STEPS[(attempt.max(1) as usize - 1).min(STEPS.len() - 1)])
+}
+
 async fn run(
-    mut ws: Ws,
+    conn: Connected,
+    mut creds: Credentials,
     mut commands: mpsc::UnboundedReceiver<Command>,
     events: mpsc::UnboundedSender<Event>,
-    mut playback: Playback,
     mut listener: Option<Listener>,
 ) {
     let emit = |e: Event| {
         let _ = events.send(e);
     };
-    let mut clock = Clock::default();
     let mut syncer = Syncer::new(None);
-    // Apply the room state once the clock is calibrated.
-    let active = |l: &Option<Listener>| l.as_ref().is_some_and(|l| l.can_listen);
-    let mut pending_apply = active(&listener);
     if let Some(l) = &listener
         && l.can_listen
         && let Some(e) = syncer.choose_device(&l.spotify).await
     {
         emit(Event::Sync(e));
     }
+
+    let Connected { mut ws, mut session, room, .. } = conn;
+    let mut playback = room.playback;
+    loop {
+        match connection(&mut ws, &mut creds, &mut commands, &emit, &mut playback, &mut listener, &mut syncer).await {
+            Ended::Quit => return,
+            Ended::Final(reason) => {
+                emit(Event::Disconnected(reason));
+                return;
+            }
+            Ended::Lost(reason) => {
+                let mut attempt = 0;
+                let conn = loop {
+                    attempt += 1;
+                    emit(Event::Reconnecting { attempt, reason: reason.clone() });
+                    // Keep watching the handle: quitting must not wait.
+                    let deadline = Instant::now() + reconnect_delay(attempt);
+                    loop {
+                        tokio::select! {
+                            _ = sleep_until(deadline) => break,
+                            cmd = commands.recv() => if cmd.is_none() { return },
+                        }
+                    }
+                    match connect(&creds, Some(&session), &mut None).await {
+                        Ok(conn) => break conn,
+                        Err(Error::Rejected(message)) => {
+                            emit(Event::Disconnected(message));
+                            return;
+                        }
+                        Err(e) => tracing::info!(%e, attempt, "reconnection failed"),
+                    }
+                };
+                ws = conn.ws;
+                session = conn.session;
+                playback = conn.room.playback.clone();
+                if let Some(l) = &mut listener {
+                    l.member_id = conn.member_id;
+                    l.can_listen = conn.room.members.iter().any(|m| m.id == conn.member_id && m.perms.listen);
+                }
+                emit(Event::Reconnected);
+                emit(Event::Server(Box::new(ServerMsg::Welcome {
+                    member_id: conn.member_id,
+                    session: session.clone(),
+                    room: conn.room,
+                })));
+            }
+        }
+    }
+}
+
+/// Serves one WebSocket connection until it ends.
+async fn connection(
+    ws: &mut Ws,
+    creds: &mut Credentials,
+    commands: &mut mpsc::UnboundedReceiver<Command>,
+    emit: &impl Fn(Event),
+    playback: &mut Playback,
+    listener: &mut Option<Listener>,
+    syncer: &mut Syncer,
+) -> Ended {
+    let mut clock = Clock::default();
+    let active = |l: &Option<Listener>| l.as_ref().is_some_and(|l| l.can_listen);
+    // Apply the room state once the clock is calibrated.
+    let mut pending_apply = active(listener);
     // Kick/ban reason, reported when the server then closes the socket.
     let mut close_reason: Option<String> = None;
+    let lost = |close_reason: &mut Option<String>, default: String| match close_reason.take() {
+        Some(r) => Ended::Final(r),
+        None => Ended::Lost(default),
+    };
 
     let mut pings_sent = 0u32;
     let mut next_ping = Instant::now();
     let mut drift_check = interval(DRIFT_CHECK_EVERY);
     drift_check.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-    let reason = loop {
+    loop {
         tokio::select! {
             frame = ws.next() => {
                 let msg = match frame {
-                    None => break close_reason.take().unwrap_or_else(|| "connexion fermée par le serveur".to_owned()),
-                    Some(Err(e)) => break close_reason.take().unwrap_or_else(|| e.to_string()),
+                    None | Some(Ok(Message::Close(_))) => return lost(&mut close_reason, "connexion fermée par le serveur".into()),
+                    Some(Err(e)) => return lost(&mut close_reason, e.to_string()),
                     Some(Ok(Message::Text(t))) => match serde_json::from_str::<ServerMsg>(t.as_str()) {
                         Ok(m) => m,
                         Err(e) => { tracing::warn!(%e, "unparsable server message"); continue; }
                     },
-                    Some(Ok(Message::Close(_))) => break close_reason.take().unwrap_or_else(|| "le serveur a fermé le salon".to_owned()),
                     Some(Ok(_)) => continue,
                 };
                 match &msg {
@@ -234,11 +360,12 @@ async fn run(
                         continue;
                     }
                     ServerMsg::Playback(p) if p.seq > playback.seq => {
-                        playback = p.clone();
-                        pending_apply = active(&listener);
+                        *playback = p.clone();
+                        pending_apply = active(listener);
                     }
+                    ServerMsg::Playback(_) => continue, // stale
                     ServerMsg::Members { members } => {
-                        if let Some(l) = &mut listener {
+                        if let Some(l) = listener.as_mut() {
                             let now = members.iter().find(|m| m.id == l.member_id).is_some_and(|m| m.perms.listen);
                             if now != l.can_listen {
                                 l.can_listen = now;
@@ -250,10 +377,11 @@ async fn run(
                             }
                         }
                     }
+                    // Reconnecting needs the current code.
+                    ServerMsg::Settings(settings) => creds.code = settings.code.clone(),
                     ServerMsg::Error { code: ErrorCode::Kicked | ErrorCode::Banned, message } => {
                         close_reason = Some(message.clone());
                     }
-                    ServerMsg::Playback(_) => continue, // stale
                     _ => {}
                 }
                 emit(Event::Server(Box::new(msg)));
@@ -261,23 +389,27 @@ async fn run(
             cmd = commands.recv() => match cmd {
                 Some(Command::Send(msg)) => {
                     let json = serde_json::to_string(&msg).expect("serializable");
-                    if let Err(e) = ws.send(Message::text(json)).await { break e.to_string(); }
+                    if let Err(e) = ws.send(Message::text(json)).await {
+                        return lost(&mut close_reason, e.to_string());
+                    }
                 }
-                Some(Command::Resync) => pending_apply = active(&listener),
+                Some(Command::Resync) => pending_apply = active(listener),
                 None => {
                     let _ = ws.close(None).await;
-                    return;
+                    return Ended::Quit;
                 }
             },
             _ = sleep_until(next_ping) => {
                 let ping = serde_json::to_string(&ClientMsg::Ping { t0: local_ms() }).expect("serializable");
-                if let Err(e) = ws.send(Message::text(ping)).await { break e.to_string(); }
+                if let Err(e) = ws.send(Message::text(ping)).await {
+                    return lost(&mut close_reason, e.to_string());
+                }
                 pings_sent += 1;
                 next_ping = Instant::now() + if pings_sent < INITIAL_PINGS { INITIAL_PING_EVERY } else { PING_EVERY };
             }
-            _ = drift_check.tick(), if active(&listener) && clock.is_ready() && !pending_apply => {
-                if let Some(l) = &listener {
-                    let events = syncer.check(&l.spotify, &clock, &playback).await;
+            _ = drift_check.tick(), if active(listener) && clock.is_ready() && !pending_apply => {
+                if let Some(l) = listener.as_ref() {
+                    let events = syncer.check(&l.spotify, &clock, playback).await;
                     let resynced = events.iter().any(|e| matches!(e, SyncEvent::Resynced { .. }));
                     events.into_iter().for_each(|e| emit(Event::Sync(e)));
                     if resynced {
@@ -290,14 +422,13 @@ async fn run(
         if pending_apply && clock.is_ready() {
             pending_apply = false;
             if let Some(l) = listener.as_ref().filter(|l| l.can_listen) {
-                for e in syncer.apply(&l.spotify, &clock, &playback).await {
+                for e in syncer.apply(&l.spotify, &clock, playback).await {
                     emit(Event::Sync(e));
                 }
             }
             drift_check.reset_at(Instant::now() + CHECK_AFTER_APPLY);
         }
-    };
-    emit(Event::Disconnected(reason));
+    }
 }
 
 #[cfg(test)]
@@ -317,6 +448,9 @@ mod tests {
 
         let i = parse_invite("ws://127.0.0.1:9000/ws").unwrap();
         assert_eq!(i.ws_url, "ws://127.0.0.1:9000/ws");
+
+        let i = parse_invite("spotitogether+tls://salon.exemple.fr/k7xq2m").unwrap();
+        assert_eq!(i, Invite { ws_url: "wss://salon.exemple.fr:443/ws".into(), code: Some("K7XQ2M".into()) });
 
         assert!(parse_invite("spotitogether:///CODE").is_err());
     }

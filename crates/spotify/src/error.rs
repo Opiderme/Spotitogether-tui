@@ -25,6 +25,9 @@ pub enum Error {
     #[error("quota de l'API Spotify dépassé, réessaie dans {0:?}")]
     RateLimited(Duration),
 
+    #[error("autorisation Spotify insuffisante : relance `spotitogether login` pour l'accorder")]
+    MissingScope,
+
     #[error("erreur API Spotify {status} : {message}")]
     Api {
         status: u16,

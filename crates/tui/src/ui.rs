@@ -35,6 +35,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.perm_panel.is_some() {
         draw_permissions(f, app, area);
     }
+    if app.playlist_picker.is_some() {
+        draw_picker(f, app, area);
+    }
     if app.show_help {
         draw_help(f, app, area);
     }
@@ -141,6 +144,8 @@ fn draw_now_playing(f: &mut Frame, app: &mut App, area: Rect) {
 
     let footer = if app.can_play && !app.my_perms().listen {
         "Ton rôle ne permet pas d'écouter : rien n'est joué sur ton compte".to_owned()
+    } else if let Some(name) = &app.settings.autoplay {
+        format!("Autoplay : {name}   ·   pochette : {} (c)", app.cover_mode.label())
     } else if app.can_play {
         format!("Pochette : {} (c pour changer)", app.cover_mode.label())
     } else {
@@ -151,6 +156,16 @@ fn draw_now_playing(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_cover(f: &mut Frame, app: &mut App, area: Rect) {
     if area.width == 0 || area.height == 0 {
+        return;
+    }
+    // Pictures are drawn over the cells by the terminal and could show
+    // through popups: characters while one is open.
+    let popup_open = app.show_help || app.perm_panel.is_some() || app.playlist_picker.is_some();
+    if app.cover_mode == crate::cover::CoverMode::Image
+        && !popup_open
+        && let Some(protocol) = app.cover_image.as_mut()
+    {
+        f.render_stateful_widget(ratatui_image::StatefulImage::default(), area, protocol);
         return;
     }
     let Some((url, img)) = &app.cover else {
@@ -236,11 +251,16 @@ fn draw_members(f: &mut Frame, app: &mut App, area: Rect) {
     let items = app.members.iter().filter(|m| host || !m.pending).map(|m| {
         let me = if m.id == app.me { " (toi)" } else { "" };
         let name = format!("{}{me}", m.name);
-        let role = if m.pending { "en attente".to_owned() } else { m.role.label().to_owned() };
+        let role = match (m.pending, m.online) {
+            (true, _) => "en attente".to_owned(),
+            (_, false) => "hors ligne".to_owned(),
+            _ => m.role.label().to_owned(),
+        };
         let custom = if m.overrides.is_empty() { "" } else { " *" };
+        let name_color = if m.online { t.text } else { t.muted };
         ListItem::new(Line::from(vec![
             Span::raw(format!("{} ", role_icon(m.role))).fg(if m.role == Role::Host { t.accent } else { t.muted }),
-            Span::raw(format!("{name:<name_w$}")).fg(t.text),
+            Span::raw(format!("{name:<name_w$}")).fg(name_color),
             Span::raw(format!("  {role}{custom}")).fg(if m.pending { t.warn } else { t.muted }),
         ]))
     });
@@ -316,7 +336,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
 fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme;
     let w = 64.min(area.width);
-    let h = 23.min(area.height);
+    let h = 24.min(area.height);
     let popup = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
     f.render_widget(Clear, popup);
     let key = |k: &str, what: &str| Line::from(vec![Span::raw(format!("  {k:<14}")).fg(t.accent), Span::raw(what.to_owned()).fg(t.text)]);
@@ -335,6 +355,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         key("r", "resynchroniser ton Spotify"),
         key("c", "pochette : ascii / blocs"),
         key("p", "permissions des membres (hôte)"),
+        key("A", "playlist d'autoplay (hôte)"),
         key("q  Ctrl+C", "quitter le salon"),
         Line::default(),
         Line::from("  Souris : clic sur les boutons, la barre de progression,").fg(t.muted),
@@ -444,4 +465,52 @@ fn draw_permissions(f: &mut Frame, app: &mut App, area: Rect) {
         Line::from("a admettre  K exclure  b bannir (2 fois)  n nouveau code").fg(t.muted),
     ]);
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_picker(f: &mut Frame, app: &mut App, area: Rect) {
+    let t = app.theme;
+    let Some(picker) = app.playlist_picker.as_mut() else { return };
+    let w = 60.min(area.width);
+    let h = 20.min(area.height);
+    let popup = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
+    f.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(t.accent))
+        .title(Line::from(" Playlist d'autoplay ").fg(t.accent).bold())
+        .title(Line::from(" Échap fermer ").fg(t.muted).right_aligned());
+    let inner = block.inner(popup).inner(Margin::new(1, 0));
+    f.render_widget(block, popup);
+    let [intro, list, help] =
+        Layout::vertical([Constraint::Length(3), Constraint::Min(1), Constraint::Length(2)]).areas(inner);
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::default(),
+            Line::from("Jouée au hasard quand la file est vide.").fg(t.muted),
+        ]),
+        intro,
+    );
+    if picker.loading {
+        f.render_widget(Paragraph::new(Line::from("Chargement de tes playlists…").fg(t.muted)), list);
+    } else if picker.playlists.is_empty() {
+        f.render_widget(Paragraph::new(Line::from("Aucune playlist sur ton compte.").fg(t.muted)), list);
+    } else {
+        let items = picker.playlists.iter().map(|p| {
+            ListItem::new(Line::from(vec![
+                Span::raw(p.name.clone()).fg(t.text),
+                Span::raw(format!("  {} morceaux", p.items.total)).fg(t.muted),
+            ]))
+        });
+        let widget = List::new(items).highlight_style(Style::new().bg(t.selection).bold()).highlight_symbol("› ");
+        f.render_stateful_widget(widget, list, &mut picker.state);
+    }
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from("Entrée choisir  o désactiver l'autoplay").fg(t.muted),
+            Line::from("Seules tes propres playlists sont lisibles (limite Spotify).").fg(t.muted),
+        ]),
+        help,
+    );
+    app.areas.picker_popup = popup;
+    app.areas.picker_rows = list;
 }

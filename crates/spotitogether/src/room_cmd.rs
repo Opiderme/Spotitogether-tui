@@ -25,10 +25,12 @@ pub struct ServeArgs {
     pub code: Option<String>,
     pub data: Option<PathBuf>,
     pub ephemeral: bool,
+    pub public: Option<String>,
+    pub tls: bool,
 }
 
 pub async fn serve(args: ServeArgs) -> Result<()> {
-    let ServeArgs { port, bind, code, data, ephemeral } = args;
+    let ServeArgs { port, bind, code, data, ephemeral, public, tls } = args;
     let code = code.map(|c| c.trim().to_uppercase()).unwrap_or_else(server::generate_code);
     if code.len() < 4 || !code.chars().all(|c| c.is_ascii_alphanumeric()) {
         bail!("code invalide : au moins 4 lettres ou chiffres");
@@ -60,8 +62,11 @@ pub async fn serve(args: ServeArgs) -> Result<()> {
         bind.to_string()
     };
     println!("Salon {code} ouvert sur {bind}:{port}\n");
-    println!("Invitation à partager : spotitogether://{lan}:{port}/{code}");
-    println!("  (hors de ton réseau local : Tailscale, Caddy ou redirection de port, voir le README)\n");
+    println!("Invitation à partager : {}", invite_link(public.as_deref(), tls, &lan, port, &code));
+    if public.is_none() {
+        println!("  (hors de ton réseau local : Tailscale, Caddy ou redirection de port, voir deploy/README.md)");
+    }
+    println!();
     match token_file {
         Ok(_) => println!(
             "Pour rejoindre en tant qu'hôte, sur cette machine :\n  spotitogether join spotitogether://127.0.0.1:{port}/{code}\n\
@@ -73,6 +78,16 @@ pub async fn serve(args: ServeArgs) -> Result<()> {
 
     server::serve(listener, code, host_token, store).await?;
     Ok(())
+}
+
+/// Invite to print: the public address when given (`--public`), the LAN one
+/// otherwise.
+fn invite_link(public: Option<&str>, tls: bool, lan: &str, port: u16, code: &str) -> String {
+    let scheme = if tls { "spotitogether+tls" } else { "spotitogether" };
+    match public {
+        Some(addr) => format!("{scheme}://{}/{code}", addr.trim_end_matches('/')),
+        None => format!("{scheme}://{lan}:{port}/{code}"),
+    }
 }
 
 /// The host token is written to a 0600 file so that `join` on the same
@@ -281,6 +296,8 @@ fn show_event(event: Event, view: &mut View) {
     match event {
         Event::Server(msg) => show_server_msg(*msg, view),
         Event::Sync(e) => show_sync_event(e),
+        Event::Reconnecting { attempt, reason } => println!("⚠ connexion perdue ({reason}), reconnexion… essai {attempt}"),
+        Event::Reconnected => println!("Reconnecté au salon."),
         Event::Clock { .. } | Event::Disconnected(_) => {}
     }
 }
@@ -319,7 +336,13 @@ fn show_server_msg(msg: ServerMsg, view: &mut View) {
         ServerMsg::Error { message, .. } => println!("⚠ {message}"),
         ServerMsg::SkipVotes { votes, needed } if votes > 0 => println!("Votes pour passer : {votes}/{needed}"),
         ServerMsg::Settings(s) => println!("Code du salon : {}", s.code),
-        ServerMsg::Welcome { .. } | ServerMsg::Pong { .. } | ServerMsg::Waiting | ServerMsg::SkipVotes { .. } => {}
+        ServerMsg::Welcome { room, .. } => {
+            view.queue = room.queue;
+            view.members = room.members;
+            print_playback(&room.playback);
+            view.playback = Some(room.playback);
+        }
+        ServerMsg::Pong { .. } | ServerMsg::Waiting | ServerMsg::SkipVotes { .. } => {}
     }
 }
 
@@ -374,6 +397,13 @@ fn print_members(members: &[Member]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builds_invite_links() {
+        assert_eq!(invite_link(None, false, "192.168.1.2", 7420, "AB"), "spotitogether://192.168.1.2:7420/AB");
+        assert_eq!(invite_link(Some("salon.fr/"), true, "x", 7420, "AB"), "spotitogether+tls://salon.fr/AB");
+        assert_eq!(invite_link(Some("pc.ts.net:7420"), false, "x", 7420, "AB"), "spotitogether://pc.ts.net:7420/AB");
+    }
 
     #[test]
     fn detects_local_server_port() {

@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use crate::auth::{self, Token};
-use crate::models::{Device, DevicesResponse, Paging, PlaybackState, SearchResponse, Track, User};
+use crate::models::{Device, DevicesResponse, Paging, PlaybackState, PlaylistEntry, PlaylistSummary, SearchResponse, Track, User};
 use crate::{Error, Result};
 
 const API: &str = "https://api.spotify.com/v1";
@@ -161,6 +161,44 @@ impl SpotifyClient {
         self.get_json(&format!("/tracks/{id}"), &[]).await
     }
 
+    // ------------------------------------------------------------ playlists
+
+    /// The user's playlists (first 50).
+    pub async fn my_playlists(&self) -> Result<Vec<PlaylistSummary>> {
+        let page: Paging<PlaylistSummary> = self.get_json("/me/playlists", &[("limit", "50".to_owned())]).await?;
+        Ok(page.items)
+    }
+
+    /// Tracks of a playlist, up to `max` (episodes and local files skipped).
+    /// Since 2026, Development Mode only returns the items of playlists the
+    /// user owns or collaborates on.
+    pub async fn playlist_tracks(&self, id: &str, max: usize) -> Result<Vec<Track>> {
+        const PAGE: usize = 50;
+        let mut tracks = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page: Paging<PlaylistEntry> = self
+                .get_json(
+                    &format!("/playlists/{id}/items"),
+                    &[("limit", PAGE.to_string()), ("offset", offset.to_string())],
+                )
+                .await?;
+            let count = page.items.len();
+            tracks.extend(
+                page.items
+                    .into_iter()
+                    .filter_map(|e| e.item)
+                    .filter(|t| t.uri.starts_with("spotify:track:") && t.duration_ms > 0),
+            );
+            offset += count;
+            if count < PAGE || tracks.len() >= max || offset >= page.total as usize {
+                break;
+            }
+        }
+        tracks.truncate(max);
+        Ok(tracks)
+    }
+
     /// Raw request for debugging (`spotitogether spotify raw`).
     /// `path` may contain a query string.
     pub async fn raw(&self, method: Method, path: &str, body: Option<&Value>) -> Result<(u16, String)> {
@@ -276,6 +314,8 @@ fn classify(status: u16, message: String, reason: Option<String>) -> Error {
     }
     if status == 403 && lower.contains("premium") {
         Error::PremiumRequired
+    } else if status == 403 && lower.contains("scope") {
+        Error::MissingScope
     } else if status == 404 && lower.contains("no active device") {
         Error::NoActiveDevice
     } else {

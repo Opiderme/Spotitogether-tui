@@ -1,0 +1,9 @@
+# Reverse proxy HTTPS pour un salon Spotitogether.
+# Remplace salon.exemple.fr par ton nom de domaine ; Caddy obtient et
+# renouvelle le certificat automatiquement, et relaie le WebSocket tel quel.
+#
+# Côté salon : spotitogether serve --bind 127.0.0.1 --public salon.exemple.fr --tls
+
+salon.exemple.fr {
+	reverse_proxy 127.0.0.1:7420
+}

@@ -47,3 +47,89 @@ async fn wrong_code_is_reported() {
     let err = join(opts(&url, "NOPE22"), None).await.err().unwrap();
     assert!(err.to_string().contains("code de salon incorrect"), "{err}");
 }
+
+/// TCP proxy whose live connections can be cut, to simulate a network drop.
+struct Proxy {
+    url: String,
+    conns: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
+impl Proxy {
+    async fn start(target: std::net::SocketAddr) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+        let conns: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> = Default::default();
+        let list = conns.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut inbound, _) = listener.accept().await.unwrap();
+                let task = tokio::spawn(async move {
+                    let mut outbound = tokio::net::TcpStream::connect(target).await.unwrap();
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                });
+                list.lock().unwrap().push(task);
+            }
+        });
+        Self { url, conns }
+    }
+
+    fn cut(&self) {
+        for task in self.conns.lock().unwrap().drain(..) {
+            task.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn reconnects_after_a_network_drop_and_keeps_its_place() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(server::serve(listener, "ABC234".into(), "tok".into(), None));
+    let proxy = Proxy::start(addr).await;
+
+    let mut joined = join(opts(&proxy.url, "ABC234"), None).await.unwrap();
+    let me = joined.member_id;
+    proxy.cut();
+
+    let mut saw_reconnecting = false;
+    let welcome = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match joined.events.recv().await.expect("events") {
+                Event::Reconnecting { .. } => saw_reconnecting = true,
+                Event::Server(msg) => {
+                    if let ServerMsg::Welcome { member_id, .. } = *msg {
+                        return member_id;
+                    }
+                }
+                Event::Disconnected(reason) => panic!("gave up: {reason}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("reconnected in time");
+    assert!(saw_reconnecting);
+    assert_eq!(welcome, me, "same member after reconnection");
+    assert!(joined.handle.send(ClientMsg::Pause));
+}
+
+#[tokio::test]
+async fn kicked_client_does_not_reconnect() {
+    use protocol::AdminCmd;
+    let url = start().await;
+    let host = join(opts(&url, "ABC234"), None).await.unwrap();
+    let mut guest = join(JoinOptions { host_token: None, name: "Max".into(), ..opts(&url, "ABC234") }, None).await.unwrap();
+    host.handle.send(ClientMsg::Admin(AdminCmd::Kick { member: guest.member_id }));
+    let reason = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match guest.events.recv().await.expect("events") {
+                Event::Disconnected(reason) => return reason,
+                Event::Reconnecting { .. } => panic!("must not reconnect after a kick"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(reason.contains("exclu"), "{reason}");
+}

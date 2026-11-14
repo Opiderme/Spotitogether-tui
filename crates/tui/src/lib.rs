@@ -3,6 +3,7 @@
 
 mod app;
 mod cover;
+mod mpris;
 mod theme;
 mod ui;
 
@@ -23,12 +24,19 @@ pub use theme::Theme;
 
 const FRAME_EVERY: Duration = Duration::from_millis(250);
 
+/// Results of background Spotify requests.
+enum Loaded {
+    Playlists(Result<Vec<spotify::models::PlaylistSummary>, String>),
+    PlaylistTracks { name: String, result: Result<Vec<spotify::models::Track>, String> },
+}
+
 /// Runs the TUI until the user quits. Returns the disconnection reason when
 /// the room connection was lost.
 pub async fn run(joined: client::Joined, spotify: Option<Arc<SpotifyClient>>) -> Result<Option<String>> {
     let mut terminal = ratatui::init();
+    let image_picker = cover::image_picker();
     let _ = execute!(stdout(), EnableMouseCapture);
-    let result = event_loop(&mut terminal, joined, spotify).await;
+    let result = event_loop(&mut terminal, joined, spotify, image_picker).await;
     let _ = execute!(stdout(), DisableMouseCapture);
     ratatui::restore();
     result
@@ -38,14 +46,24 @@ async fn event_loop(
     terminal: &mut DefaultTerminal,
     mut joined: client::Joined,
     spotify: Option<Arc<SpotifyClient>>,
+    image_picker: Option<ratatui_image::picker::Picker>,
 ) -> Result<Option<String>> {
     let mut app = App::new(&joined, spotify.is_some(), Theme::load());
+    if let Some(p) = &image_picker {
+        tracing::info!(protocol = ?p.protocol_type(), "terminal graphics");
+    }
+    app.image_picker = image_picker;
     let room = joined.handle.clone();
     let http = SpotifyClient::http_client();
 
     let (search_tx, mut search_rx) = mpsc::unbounded_channel::<SearchOutcome>();
     let (cover_tx, mut cover_rx) = mpsc::unbounded_channel();
     let (theme_tx, mut theme_rx) = mpsc::unbounded_channel::<()>();
+    let (loaded_tx, mut loaded_rx) = mpsc::unbounded_channel::<Loaded>();
+    let (mpris_cmd_tx, mut mpris_cmd_rx) = mpsc::unbounded_channel();
+    let mpris = mpris::spawn(mpris_cmd_tx);
+    let mut mpris_shown = mpris::Shown::default();
+    let mut frames = 0u64;
     // Kept alive for the whole session.
     let _theme_watcher = watch_theme(theme_tx);
 
@@ -76,6 +94,27 @@ async fn event_loop(
                         });
                     }
                 }
+                Effect::LoadPlaylists => {
+                    if let Some(sp) = spotify.clone() {
+                        let tx = loaded_tx.clone();
+                        tokio::spawn(async move {
+                            let result = sp.my_playlists().await.map_err(|e| e.to_string());
+                            let _ = tx.send(Loaded::Playlists(result));
+                        });
+                    }
+                }
+                Effect::LoadPlaylistTracks { id, name } => {
+                    if let Some(sp) = spotify.clone() {
+                        let tx = loaded_tx.clone();
+                        tokio::spawn(async move {
+                            let result = sp
+                                .playlist_tracks(&id, protocol::MAX_AUTOPLAY_TRACKS)
+                                .await
+                                .map_err(|e| e.to_string());
+                            let _ = tx.send(Loaded::PlaylistTracks { name, result });
+                        });
+                    }
+                }
                 Effect::FetchCover(url) => {
                     let (http, tx) = (http.clone(), cover_tx.clone());
                     tokio::spawn(async move {
@@ -87,6 +126,11 @@ async fn event_loop(
         }
 
         terminal.draw(|f| ui::draw(f, &mut app))?;
+        if let Some(tx) = &mpris {
+            for update in mpris::diff(&mut mpris_shown, &app) {
+                let _ = tx.send(update);
+            }
+        }
 
         effects = tokio::select! {
             Some(Ok(event)) = terminal_events.next() => app.on_terminal_event(event),
@@ -100,7 +144,19 @@ async fn event_loop(
             Some(outcome) = search_rx.recv() => { app.on_search(outcome); vec![] }
             Some((url, img)) = cover_rx.recv() => { app.on_cover(url, img); vec![] }
             Some(()) = theme_rx.recv() => { app.theme = Theme::load(); vec![] }
-            _ = frame.tick() => vec![],
+            Some(loaded) = loaded_rx.recv() => match loaded {
+                Loaded::Playlists(result) => { app.on_playlists(result); vec![] }
+                Loaded::PlaylistTracks { name, result } => app.on_playlist_tracks(name, result),
+            },
+            Some(cmd) = mpris_cmd_rx.recv() => app.on_mpris(cmd),
+            _ = frame.tick() => {
+                frames += 1;
+                // Position refresh for MPRIS clients, once per second.
+                if let Some(tx) = mpris.as_ref().filter(|_| frames.is_multiple_of(4) && app.playback.current.is_some()) {
+                    let _ = tx.send(mpris::Update::Position(app.position_ms()));
+                }
+                vec![]
+            }
         };
     }
 }
