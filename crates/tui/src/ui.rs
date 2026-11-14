@@ -319,9 +319,12 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme;
     let me = app.me().map(|m| m.name.as_str()).unwrap_or("?");
     let role = app.me().map(|m| format!(" ({})", m.role.label().to_lowercase())).unwrap_or_default();
+    let room = match app.current_invite() {
+        Some(link) if app.hosting => format!("{link} (i copier)"),
+        _ => app.settings.code.clone(),
+    };
     let left = format!(
-        " {} │ {} membre{} │ {me}{role} │ / chercher  espace pause  s suivant  ? aide  q quitter",
-        app.settings.code,
+        " {room} │ {} membre{} │ {me}{role} │ / chercher  espace pause  s suivant  ? aide  q quitter",
         app.members.len(),
         if app.members.len() > 1 { "s" } else { "" },
     );
@@ -336,7 +339,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
 fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme;
     let w = 64.min(area.width);
-    let h = 24.min(area.height);
+    let h = 25.min(area.height);
     let popup = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
     f.render_widget(Clear, popup);
     let key = |k: &str, what: &str| Line::from(vec![Span::raw(format!("  {k:<14}")).fg(t.accent), Span::raw(what.to_owned()).fg(t.text)]);
@@ -356,6 +359,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         key("c", "pochette : ascii / blocs"),
         key("p", "permissions des membres (hôte)"),
         key("A", "playlist d'autoplay (hôte)"),
+        key("i", "copier le lien d'invitation"),
         key("q  Ctrl+C", "quitter le salon"),
         Line::default(),
         Line::from("  Souris : clic sur les boutons, la barre de progression,").fg(t.muted),

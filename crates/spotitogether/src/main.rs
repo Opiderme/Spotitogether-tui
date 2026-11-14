@@ -1,4 +1,5 @@
 mod config;
+mod home;
 mod room_cmd;
 mod secrets;
 mod spotify_cmd;
@@ -12,10 +13,20 @@ use clap::{Parser, Subcommand};
 use config::{Config, is_valid_client_id};
 
 #[derive(Parser)]
-#[command(name = "spotitogether", version, about = "Écoute Spotify synchronisée entre amis, dans le terminal")]
+#[command(
+    name = "spotitogether",
+    version,
+    about = "Écoute Spotify synchronisée entre amis, dans le terminal",
+    long_about = "Écoute Spotify synchronisée entre amis, dans le terminal.\n\n\
+                  Sans argument : écran d'accueil pour créer un salon ou en rejoindre un.\n\
+                  Avec un lien d'invitation : rejoint ce salon directement.",
+    args_conflicts_with_subcommands = true
+)]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
+    /// Lien d'invitation à rejoindre directement (spotitogether://hôte:port/CODE)
+    invite: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -87,7 +98,7 @@ enum Command {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    init_logging(&cli.command);
+    init_logging(cli.command.as_ref());
 
     if let Err(err) = run(cli).await {
         eprintln!("Erreur : {err:#}");
@@ -96,7 +107,10 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    match cli.command {
+    let Some(command) = cli.command else {
+        return home::run(cli.invite).await;
+    };
+    match command {
         Command::Setup { client_id } => setup(client_id),
         Command::Login => login().await,
         Command::Logout => {
@@ -116,11 +130,11 @@ async fn run(cli: Cli) -> Result<()> {
 
 /// The server logs joins/leaves to stderr; the TUI owns the screen, so it
 /// logs to `~/.cache/spotitogether/spotitogether.log` instead.
-fn init_logging(command: &Command) {
+fn init_logging(command: Option<&Command>) {
     let builder = tracing_subscriber::fmt().with_target(false);
     match command {
-        Command::Serve { .. } => builder.with_max_level(tracing::Level::INFO).with_writer(io::stderr).init(),
-        Command::Join { plain: false, .. } => {
+        Some(Command::Serve { .. }) => builder.with_max_level(tracing::Level::INFO).with_writer(io::stderr).init(),
+        None | Some(Command::Join { plain: false, .. }) => {
             let file = config::project_dirs().ok().and_then(|d| {
                 std::fs::create_dir_all(d.cache_dir()).ok()?;
                 std::fs::OpenOptions::new().create(true).append(true).open(d.cache_dir().join("spotitogether.log")).ok()

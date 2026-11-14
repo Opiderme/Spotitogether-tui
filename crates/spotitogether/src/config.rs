@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     /// Client ID of the user's own Spotify app (see `spotitogether setup`).
     pub client_id: Option<String>,
+    /// Last invite joined from the home screen.
+    #[serde(default)]
+    pub last_invite: Option<String>,
 }
 
 pub fn project_dirs() -> Result<ProjectDirs> {

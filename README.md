@@ -30,30 +30,25 @@ Les PKGBUILD sont dans `deploy/aur/`.
 ## Premiers pas
 
 ```sh
-spotitogether setup     # crée ton app Spotify et enregistre son Client ID
-spotitogether login     # autorise l'accès dans le navigateur
-spotitogether spotify devices
-spotitogether spotify play daft punk one more time
-spotitogether spotify status
+spotitogether
 ```
 
-## Héberger et rejoindre un salon
+L'écran d'accueil propose de **créer un salon** ou d'en **rejoindre un** en
+collant le lien d'invitation. La première fois, il propose aussi de configurer
+Spotify (création de ton app, voir plus bas) puis de te connecter.
 
-```sh
-# Terminal 1 : l'hôte lance le salon
-spotitogether serve                 # affiche le code et le lien d'invitation
+- **Créer un salon** : le salon tourne dans le programme, sur le premier port
+  libre à partir de 7420. Le lien d'invitation s'affiche en bas de l'écran et
+  `i` le copie dans le presse-papiers. Quitter (`q` deux fois) ferme le salon.
+- **Rejoindre** : colle le lien (`spotitogether://192.168.1.19:7420/K7XQ2M`). Le
+  dernier lien est mémorisé. `spotitogether <lien>` rejoint directement, et
+  l'entrée de bureau ouvre les liens `spotitogether://`.
 
-# Terminal 2 : l'hôte rejoint son propre salon (rôle d'hôte automatique)
-spotitogether join spotitogether://127.0.0.1:7420/K7XQ2M
+Pour un salon qui reste ouvert sans toi (serveur, Docker, systemd), il y a
+`spotitogether serve` ; `spotitogether join <lien>` rejoint sans passer par
+l'accueil. Les commandes `setup`, `login` et `spotify …` restent disponibles.
 
-# Chez un ami
-spotitogether join spotitogether://192.168.1.19:7420/K7XQ2M
-
-# Tester en invité depuis la machine de l'hôte
-spotitogether join spotitogether://127.0.0.1:7420/K7XQ2M --guest --spectator --name Test
-```
-
-`join` ouvre l'interface plein écran, pilotable au clavier et à la souris :
+Dans un salon, l'interface plein écran se pilote au clavier et à la souris :
 
 | Touche | Action |
 | --- | --- |
@@ -64,6 +59,7 @@ spotitogether join spotitogether://127.0.0.1:7420/K7XQ2M --guest --spectator --n
 | `c` | pochette en ASCII, en blocs colorés ou en vraie image (Sixel/Kitty) |
 | `p` | permissions des membres (hôte) |
 | `A` | playlist d'autoplay, jouée quand la file est vide (hôte) |
+| `i` | copier le lien d'invitation |
 | `?`, `q` | aide, quitter |
 
 À la souris : boutons, barre de progression (clic pour se déplacer), glisser une

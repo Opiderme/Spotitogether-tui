@@ -24,6 +24,8 @@ pub enum Effect {
     Search { request: u64, query: String, offset: u32 },
     FetchCover(String),
     LoadPlaylists,
+    /// Copy the invite link to the clipboard.
+    CopyInvite(String),
     LoadPlaylistTracks { id: String, name: String },
     Resync,
     Quit,
@@ -130,6 +132,12 @@ pub struct CoverCache {
 }
 
 pub struct App {
+    /// Invite link to share (known when this process hosts the room).
+    pub invite: Option<String>,
+    /// This process hosts the room: quitting closes it for everyone.
+    pub hosting: bool,
+    /// First `q` of a host, waiting for confirmation.
+    pub quit_armed: Option<Instant>,
     pub settings: RoomSettings,
     /// Skip votes: (votes, needed).
     pub votes: (u32, u32),
@@ -169,6 +177,9 @@ impl App {
     pub fn new(joined: &client::Joined, can_play: bool, theme: Theme) -> Self {
         let room = &joined.room;
         let mut app = Self {
+            invite: None,
+            hosting: false,
+            quit_armed: None,
             settings: room.settings.clone(),
             votes: (0, 0),
             perm_panel: None,
@@ -215,6 +226,13 @@ impl App {
 
     pub fn is_host(&self) -> bool {
         self.me().is_some_and(|m| m.role == Role::Host)
+    }
+
+    /// Invite link with the current code (the host may have rotated it).
+    pub fn current_invite(&self) -> Option<String> {
+        let link = self.invite.as_ref()?;
+        let base = link.rsplit_once('/').map_or(link.as_str(), |(base, _)| base);
+        Some(format!("{base}/{}", self.settings.code))
     }
 
     pub fn my_perms(&self) -> Permissions {
@@ -417,7 +435,18 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Char('q') => return vec![Effect::Quit],
+            KeyCode::Char('q') => {
+                let confirmed = self.quit_armed.is_some_and(|t| t.elapsed() < Duration::from_secs(3));
+                if !self.hosting || confirmed {
+                    return vec![Effect::Quit];
+                }
+                self.quit_armed = Some(Instant::now());
+                self.toast("Tu héberges : quitter ferme le salon pour tout le monde (q encore)", Level::Warn);
+            }
+            KeyCode::Char('i') => match self.current_invite() {
+                Some(link) => return vec![Effect::CopyInvite(link)],
+                None => self.toast(format!("Code du salon : {} (demande le lien à l'hôte)", self.settings.code), Level::Info),
+            },
             KeyCode::Tab => self.focus = self.focus.next(),
             KeyCode::BackTab => self.focus = self.focus.prev(),
             KeyCode::Char('/') => {
@@ -1250,5 +1279,19 @@ mod tests {
         a.me = 2; // listener: no playback control
         assert!(a.on_mpris(Command::PlayPause).is_empty());
         assert!(diff(&mut shown, &a).contains(&Update::Controls { playback: false, skip: true }));
+    }
+
+    #[test]
+    fn host_quit_needs_confirmation_and_i_copies_the_invite() {
+        let mut a = app();
+        a.hosting = true;
+        a.invite = Some("spotitogether://192.168.1.19:7420/K7XQ2M".into());
+        assert!(a.on_key(key(KeyCode::Char('q'))).is_empty());
+        assert_eq!(a.on_key(key(KeyCode::Char('q'))), [Effect::Quit]);
+
+        a.settings.code = "NEW123".into();
+        assert_eq!(a.on_key(key(KeyCode::Char('i'))), [Effect::CopyInvite("spotitogether://192.168.1.19:7420/NEW123".into())]);
+        a.hosting = false;
+        assert_eq!(a.on_key(key(KeyCode::Char('q'))), [Effect::Quit], "guests quit at once");
     }
 }

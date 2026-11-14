@@ -43,14 +43,7 @@ pub async fn serve(args: ServeArgs) -> Result<()> {
     let store = if ephemeral {
         None
     } else {
-        let path = match data {
-            Some(p) => p,
-            None => project_dirs()?.data_dir().join(format!("room-{port}.sqlite")),
-        };
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir).with_context(|| format!("création de {}", dir.display()))?;
-        }
-        let store = server::Store::open(&path).with_context(|| format!("ouverture de {}", path.display()))?;
+        let (store, path) = open_store(port, data)?;
         println!("Rôles, bannis et réglages enregistrés dans {}", path.display());
         Some(store)
     };
@@ -80,9 +73,22 @@ pub async fn serve(args: ServeArgs) -> Result<()> {
     Ok(())
 }
 
+/// SQLite store of the room (default `~/.local/share/spotitogether/room-<port>.sqlite`).
+pub(crate) fn open_store(port: u16, path: Option<PathBuf>) -> Result<(server::Store, PathBuf)> {
+    let path = match path {
+        Some(p) => p,
+        None => project_dirs()?.data_dir().join(format!("room-{port}.sqlite")),
+    };
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("création de {}", dir.display()))?;
+    }
+    let store = server::Store::open(&path).with_context(|| format!("ouverture de {}", path.display()))?;
+    Ok((store, path))
+}
+
 /// Invite to print: the public address when given (`--public`), the LAN one
 /// otherwise.
-fn invite_link(public: Option<&str>, tls: bool, lan: &str, port: u16, code: &str) -> String {
+pub(crate) fn invite_link(public: Option<&str>, tls: bool, lan: &str, port: u16, code: &str) -> String {
     let scheme = if tls { "spotitogether+tls" } else { "spotitogether" };
     match public {
         Some(addr) => format!("{scheme}://{}/{code}", addr.trim_end_matches('/')),
@@ -108,13 +114,13 @@ fn save_host_token(port: u16, token: &str) -> Result<()> {
     Ok(())
 }
 
-fn load_host_token(port: u16) -> Option<String> {
+pub(crate) fn load_host_token(port: u16) -> Option<String> {
     fs::read_to_string(host_token_path(port).ok()?).ok().map(|s| s.trim().to_owned())
 }
 
 /// Local network address, found by asking the OS which interface it would
 /// use to reach a public address (UDP connect sends no packet).
-fn lan_ip() -> Option<IpAddr> {
+pub(crate) fn lan_ip() -> Option<IpAddr> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
     socket.connect((Ipv4Addr::new(1, 1, 1, 1), 80)).ok()?;
     socket.local_addr().ok().map(|a| a.ip())
@@ -185,7 +191,8 @@ pub async fn join(args: JoinArgs) -> Result<()> {
     .await?;
 
     if !args.plain {
-        return match tui::run(joined, spotify).await? {
+        let options = tui::RunOptions { invite: Some(args.invite.clone()), hosting: false };
+        return match tui::run(joined, spotify, options).await? {
             Some(reason) => bail!("déconnecté du salon : {reason}"),
             None => Ok(()),
         };
@@ -230,7 +237,7 @@ pub async fn join(args: JoinArgs) -> Result<()> {
     }
 }
 
-fn local_port(ws_url: &str) -> Option<u16> {
+pub(crate) fn local_port(ws_url: &str) -> Option<u16> {
     let rest = ws_url.strip_prefix("ws://")?;
     let host_port = rest.split('/').next()?;
     let (host, port) = host_port.rsplit_once(':')?;

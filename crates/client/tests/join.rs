@@ -133,3 +133,28 @@ async fn kicked_client_does_not_reconnect() {
     .unwrap();
     assert!(reason.contains("exclu"), "{reason}");
 }
+
+#[tokio::test]
+async fn closing_the_room_disconnects_members_for_good() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(server::serve_until(listener, "ABC234".into(), "tok".into(), None, async {
+        let _ = stopped.await;
+    }));
+    let mut guest = join(JoinOptions { host_token: None, ..opts(&url, "ABC234") }, None).await.unwrap();
+    stop.send(()).unwrap();
+    let reason = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match guest.events.recv().await.expect("events") {
+                Event::Disconnected(reason) => return reason,
+                Event::Reconnecting { .. } => panic!("must not reconnect to a closed room"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(reason.contains("fermé"), "{reason}");
+    tokio::time::timeout(Duration::from_secs(5), server).await.expect("server stops").unwrap().unwrap();
+}

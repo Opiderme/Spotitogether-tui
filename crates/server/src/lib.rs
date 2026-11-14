@@ -71,6 +71,10 @@ enum Cmd {
         id: MemberId,
         conn: ConnId,
     },
+    /// Tell everyone the room is closing, drop all connections, stop.
+    Shutdown {
+        done: oneshot::Sender<()>,
+    },
 }
 
 /// Identifies one WebSocket connection: after a reconnection, the old
@@ -90,17 +94,38 @@ struct AppState {
 /// Serves the room on `listener` until the process stops. With a `store`,
 /// roles, bans and settings persist across restarts.
 pub async fn serve(listener: TcpListener, code: String, host_token: String, store: Option<Store>) -> std::io::Result<()> {
+    serve_until(listener, code, host_token, store, std::future::pending()).await
+}
+
+/// Like [`serve`], until `shutdown` completes: members are then told that
+/// the host closed the room (their clients do not try to reconnect).
+pub async fn serve_until(
+    listener: TcpListener,
+    code: String,
+    host_token: String,
+    store: Option<Store>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
     let room = Room::new(code.clone(), host_token, now_ms(), store);
     let (room_tx, room_rx) = mpsc::unbounded_channel();
     let code = Arc::new(RwLock::new(code));
     tokio::spawn(run_room(room, room_rx, code.clone()));
 
+    let closer = room_tx.clone();
     let state = AppState { room_tx, code, bad_codes: Default::default() };
     let app = Router::new()
         .route(WS_PATH, get(ws_handler))
         .route("/health", get(|| async { "ok" }))
         .with_state(state);
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .with_graceful_shutdown(async move {
+            shutdown.await;
+            let (done, closed) = oneshot::channel();
+            if closer.send(Cmd::Shutdown { done }).is_ok() {
+                let _ = closed.await;
+            }
+        })
+        .await
 }
 
 /// Single task owning the room: applies commands in order and fires the
@@ -156,6 +181,17 @@ async fn run_room(mut room: Room, mut rx: mpsc::UnboundedReceiver<Cmd>, shared_c
                 }
             }
             Some(Cmd::Msg { from, msg }) => room.handle(from, msg, now),
+            Some(Cmd::Shutdown { done }) => {
+                let bye = ServerMsg::Error { code: ErrorCode::RoomClosed, message: "l'hôte a fermé le salon".into() };
+                for (_, tx) in conns.values() {
+                    let _ = tx.send(bye.clone());
+                }
+                // Dropping the senders closes every connection.
+                conns.clear();
+                let _ = done.send(());
+                tracing::info!("room closed");
+                return;
+            }
             Some(Cmd::Leave { id, conn }) => {
                 if conns.get(&id).map(|(c, _)| *c) != Some(conn) {
                     continue; // stale connection of a resumed member

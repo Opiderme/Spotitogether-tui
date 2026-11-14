@@ -379,7 +379,7 @@ async fn connection(
                     }
                     // Reconnecting needs the current code.
                     ServerMsg::Settings(settings) => creds.code = settings.code.clone(),
-                    ServerMsg::Error { code: ErrorCode::Kicked | ErrorCode::Banned, message } => {
+                    ServerMsg::Error { code: ErrorCode::Kicked | ErrorCode::Banned | ErrorCode::RoomClosed, message } => {
                         close_reason = Some(message.clone());
                     }
                     _ => {}

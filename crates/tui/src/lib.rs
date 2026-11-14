@@ -3,6 +3,7 @@
 
 mod app;
 mod cover;
+pub mod launcher;
 mod mpris;
 mod theme;
 mod ui;
@@ -30,13 +31,22 @@ enum Loaded {
     PlaylistTracks { name: String, result: Result<Vec<spotify::models::Track>, String> },
 }
 
+/// How the room screen was opened.
+#[derive(Debug, Clone, Default)]
+pub struct RunOptions {
+    /// Invite link to show and copy (`i`).
+    pub invite: Option<String>,
+    /// This process hosts the room: quitting closes it.
+    pub hosting: bool,
+}
+
 /// Runs the TUI until the user quits. Returns the disconnection reason when
 /// the room connection was lost.
-pub async fn run(joined: client::Joined, spotify: Option<Arc<SpotifyClient>>) -> Result<Option<String>> {
+pub async fn run(joined: client::Joined, spotify: Option<Arc<SpotifyClient>>, options: RunOptions) -> Result<Option<String>> {
     let mut terminal = ratatui::init();
     let image_picker = cover::image_picker();
     let _ = execute!(stdout(), EnableMouseCapture);
-    let result = event_loop(&mut terminal, joined, spotify, image_picker).await;
+    let result = event_loop(&mut terminal, joined, spotify, image_picker, options).await;
     let _ = execute!(stdout(), DisableMouseCapture);
     ratatui::restore();
     result
@@ -47,8 +57,11 @@ async fn event_loop(
     mut joined: client::Joined,
     spotify: Option<Arc<SpotifyClient>>,
     image_picker: Option<ratatui_image::picker::Picker>,
+    options: RunOptions,
 ) -> Result<Option<String>> {
     let mut app = App::new(&joined, spotify.is_some(), Theme::load());
+    app.invite = options.invite;
+    app.hosting = options.hosting;
     if let Some(p) = &image_picker {
         tracing::info!(protocol = ?p.protocol_type(), "terminal graphics");
     }
@@ -93,6 +106,10 @@ async fn event_loop(
                             let _ = tx.send(SearchOutcome { request, offset, result });
                         });
                     }
+                }
+                Effect::CopyInvite(link) => {
+                    let how = copy_to_clipboard(&link);
+                    app.toast(format!("Lien copié ({how}) : {link}"), app::Level::Good);
                 }
                 Effect::LoadPlaylists => {
                     if let Some(sp) = spotify.clone() {
@@ -159,6 +176,29 @@ async fn event_loop(
             }
         };
     }
+}
+
+/// Copies `text`: `wl-copy` on Wayland (Hyprland), `xclip` on X11, else the
+/// terminal's OSC 52 sequence (supported by foot, kitty, WezTerm…).
+fn copy_to_clipboard(text: &str) -> &'static str {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let tools: [(&str, &[&str]); 2] = [("wl-copy", &[]), ("xclip", &["-selection", "clipboard"])];
+    for (tool, args) in tools {
+        let child = Command::new(tool).args(args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+        if let Ok(mut child) = child {
+            let written = child.stdin.take().is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
+            if written && child.wait().is_ok_and(|s| s.success()) {
+                return tool;
+            }
+        }
+    }
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let mut out = stdout();
+    let _ = write!(out, "\x1b]52;c;{encoded}\x07");
+    let _ = out.flush();
+    "terminal"
 }
 
 /// Reloads colours when Caelestia rewrites its scheme (wallpaper change).

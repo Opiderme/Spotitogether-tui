@@ -111,6 +111,8 @@ pub enum ErrorCode {
     Kicked,
     Banned,
     Refused,
+    /// The host closed the room (sent just before the connection closes).
+    RoomClosed,
 }
 
 /// Track metadata sent by the client that queues it (batch track lookup is
