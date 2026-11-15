@@ -27,10 +27,11 @@ pub struct ServeArgs {
     pub ephemeral: bool,
     pub public: Option<String>,
     pub tls: bool,
+    pub no_p2p: bool,
 }
 
 pub async fn serve(args: ServeArgs) -> Result<()> {
-    let ServeArgs { port, bind, code, data, ephemeral, public, tls } = args;
+    let ServeArgs { port, bind, code, data, ephemeral, public, tls, no_p2p } = args;
     let code = code.map(|c| c.trim().to_uppercase()).unwrap_or_else(server::generate_code);
     if code.len() < 4 || !code.chars().all(|c| c.is_ascii_alphanumeric()) {
         bail!("code invalide : au moins 4 lettres ou chiffres");
@@ -48,16 +49,28 @@ pub async fn serve(args: ServeArgs) -> Result<()> {
         Some(store)
     };
 
-    // Listening on every interface: advertise the LAN address.
-    let lan = if bind.is_unspecified() {
-        lan_ip().map(|ip| ip.to_string()).unwrap_or_else(|| "<ton-ip>".into())
+    // Peer-to-peer access: works from anywhere, nothing to configure.
+    let tunnel = if no_p2p {
+        None
     } else {
-        bind.to_string()
+        match start_host_tunnel(port).await {
+            Ok(t) => Some(t),
+            Err(e) => {
+                println!("⚠ accès pair-à-pair indisponible ({e:#}) : seul le lien direct marchera");
+                None
+            }
+        }
     };
+    let (lan, _) = if bind.is_unspecified() { invite_host() } else { (bind.to_string(), is_local_only(&bind.to_string())) };
     println!("Salon {code} ouvert sur {bind}:{port}\n");
-    println!("Invitation à partager : {}", invite_link(public.as_deref(), tls, &lan, port, &code));
-    if public.is_none() {
-        println!("  (hors de ton réseau local : Tailscale, Caddy ou redirection de port, voir deploy/README.md)");
+    if let Some(t) = &tunnel {
+        println!("Invitation à partager (marche partout) : spotitogether://{}/{code}", t.id());
+    }
+    let direct = invite_link(public.as_deref(), tls, &lan, port, &code);
+    match (&public, &tunnel) {
+        (Some(_), _) => println!("Invitation directe : {direct}"),
+        (None, Some(_)) => println!("Sur ton réseau local uniquement : {direct}"),
+        (None, None) => println!("Invitation (réseau local uniquement) : {direct}"),
     }
     println!();
     match token_file {
@@ -126,6 +139,47 @@ pub(crate) fn lan_ip() -> Option<IpAddr> {
     socket.local_addr().ok().map(|a| a.ip())
 }
 
+/// LAN address for direct invites, and whether it only works locally.
+pub(crate) fn invite_host() -> (String, bool) {
+    match lan_ip() {
+        Some(ip) => (ip.to_string(), true),
+        None => ("127.0.0.1".into(), true),
+    }
+}
+
+/// Peer-to-peer host key, kept in `~/.local/share/spotitogether/p2p-host.key`
+/// (0600) so the invite address stays the same between sessions.
+pub(crate) fn host_secret() -> Result<[u8; 32]> {
+    let path = project_dirs()?.data_dir().join("p2p-host.key");
+    if let Ok(bytes) = fs::read(&path)
+        && let Ok(key) = <[u8; 32]>::try_from(bytes.as_slice())
+    {
+        return Ok(key);
+    }
+    let key = client::tunnel::generate_secret();
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let mut f = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)?;
+    f.write_all(&key)?;
+    Ok(key)
+}
+
+/// Starts the peer-to-peer access to a room server listening on `port`.
+pub(crate) async fn start_host_tunnel(port: u16) -> Result<client::tunnel::HostTunnel> {
+    let local = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    Ok(client::tunnel::HostTunnel::start(host_secret()?, local).await?)
+}
+
+/// True for addresses that only exist on a local network (or this machine).
+pub(crate) fn is_local_only(host: &str) -> bool {
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+        Ok(IpAddr::V6(ip)) => ip.is_loopback(),
+        Err(_) => host == "localhost",
+    }
+}
+
 // ------------------------------------------------------------------- join
 
 pub struct JoinArgs {
@@ -158,7 +212,9 @@ Commandes :
 
 pub async fn join(args: JoinArgs) -> Result<()> {
     let invite = parse_invite(&args.invite)?;
-    let code = args.code.or(invite.code).context("code du salon manquant : spotitogether://hôte:port/CODE ou --code")?;
+    let code = args.code.or(invite.code.clone()).context("code du salon manquant : spotitogether://hôte:port/CODE ou --code")?;
+    // Peer-to-peer invite: the tunnel lives as long as this session.
+    let (ws_url, _tunnel) = invite.connect_url().await?;
 
     let spotify = if args.spectator { None } else { Some(Arc::new(connect()?)) };
     let profile = match &spotify {
@@ -179,7 +235,7 @@ pub async fn join(args: JoinArgs) -> Result<()> {
 
     let mut joined = client::join(
         JoinOptions {
-            ws_url: invite.ws_url,
+            ws_url,
             code: code.to_uppercase(),
             name,
             host_token,
@@ -191,7 +247,7 @@ pub async fn join(args: JoinArgs) -> Result<()> {
     .await?;
 
     if !args.plain {
-        let options = tui::RunOptions { invite: Some(args.invite.clone()), hosting: false };
+        let options = tui::RunOptions { invite: Some(args.invite.clone()), hosting: false, notice: None };
         return match tui::run(joined, spotify, options).await? {
             Some(reason) => bail!("déconnecté du salon : {reason}"),
             None => Ok(()),
@@ -410,6 +466,13 @@ mod tests {
         assert_eq!(invite_link(None, false, "192.168.1.2", 7420, "AB"), "spotitogether://192.168.1.2:7420/AB");
         assert_eq!(invite_link(Some("salon.fr/"), true, "x", 7420, "AB"), "spotitogether+tls://salon.fr/AB");
         assert_eq!(invite_link(Some("pc.ts.net:7420"), false, "x", 7420, "AB"), "spotitogether://pc.ts.net:7420/AB");
+    }
+
+    #[test]
+    fn classifies_addresses() {
+        assert!(is_local_only("192.168.1.19"));
+        assert!(is_local_only("127.0.0.1"));
+        assert!(!is_local_only("salon.exemple.fr"));
     }
 
     #[test]

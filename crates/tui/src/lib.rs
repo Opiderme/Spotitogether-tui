@@ -38,6 +38,8 @@ pub struct RunOptions {
     pub invite: Option<String>,
     /// This process hosts the room: quitting closes it.
     pub hosting: bool,
+    /// Shown once at start (e.g. "this link only works on your LAN").
+    pub notice: Option<String>,
 }
 
 /// Runs the TUI until the user quits. Returns the disconnection reason when
@@ -62,6 +64,9 @@ async fn event_loop(
     let mut app = App::new(&joined, spotify.is_some(), Theme::load());
     app.invite = options.invite;
     app.hosting = options.hosting;
+    if let Some(notice) = options.notice {
+        app.toast(notice, app::Level::Warn);
+    }
     if let Some(p) = &image_picker {
         tracing::info!(protocol = ?p.protocol_type(), "terminal graphics");
     }

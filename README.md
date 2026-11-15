@@ -37,11 +37,13 @@ L'écran d'accueil propose de **créer un salon** ou d'en **rejoindre un** en
 collant le lien d'invitation. La première fois, il propose aussi de configurer
 Spotify (création de ton app, voir plus bas) puis de te connecter.
 
-- **Créer un salon** : le salon tourne dans le programme, sur le premier port
-  libre à partir de 7420. Le lien d'invitation s'affiche en bas de l'écran et
-  `i` le copie dans le presse-papiers. Quitter (`q` deux fois) ferme le salon.
-- **Rejoindre** : colle le lien (`spotitogether://192.168.1.19:7420/K7XQ2M`). Le
-  dernier lien est mémorisé. `spotitogether <lien>` rejoint directement, et
+- **Créer un salon** : le salon tourne dans le programme. Le lien d'invitation
+  s'affiche en bas de l'écran et `i` le copie dans le presse-papiers. Il marche
+  depuis n'importe où, sans port à ouvrir ni logiciel à installer (connexion
+  pair-à-pair, voir [`deploy/README.md`](deploy/README.md)). Quitter (`q` deux
+  fois) ferme le salon.
+- **Rejoindre** : colle le lien (`spotitogether://<clé>/K7XQ2M`). Le dernier lien
+  est mémorisé. `spotitogether <lien>` rejoint directement, et
   l'entrée de bureau ouvre les liens `spotitogether://`.
 
 Pour un salon qui reste ouvert sans toi (serveur, Docker, systemd), il y a
@@ -93,8 +95,9 @@ réglages sont gardés dans `~/.local/share/spotitogether/room-<port>.sqlite`
 (`serve --ephemeral` pour ne rien enregistrer). Les droits sont vérifiés par le
 serveur, quel que soit le client utilisé.
 
-Pour inviter des amis hors de ton réseau (Tailscale, HTTPS avec Caddy,
-redirection de port), voir [`deploy/README.md`](deploy/README.md).
+Les invitations marchent hors de ton réseau sans configuration ; pour un salon
+permanent sur un serveur (Tailscale, HTTPS avec Caddy, redirection de port), voir
+[`deploy/README.md`](deploy/README.md).
 
 Chaque utilisateur crée sa propre app sur le
 [dashboard Spotify](https://developer.spotify.com/dashboard) : depuis février 2026,

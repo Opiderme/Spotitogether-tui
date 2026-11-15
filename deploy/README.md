@@ -1,11 +1,30 @@
 # Héberger un salon accessible depuis Internet
 
-Par défaut, `spotitogether serve` n'est joignable que sur ton réseau local. Pour
-inviter des amis ailleurs, trois options, de la plus simple à la plus complète.
-Le serveur ne transporte que l'état du salon (file, position, membres) : aucun
-son ni jeton Spotify ne passe par lui.
+**Par défaut, rien à faire.** Quand tu crées un salon (écran d'accueil ou
+`spotitogether serve`), le lien affiché est de la forme
+`spotitogether://<clé de ta machine>/CODE` et marche depuis n'importe où, sans
+ouvrir de port ni installer quoi que ce soit, comme le multijoueur des jeux en
+self-host.
 
-## 1. Tailscale (recommandé entre amis)
+Sous le capot, la bibliothèque [iroh](https://www.iroh.computer) :
+
+- retrouve ta machine grâce à sa clé publique (annuaire public `iroh.link`) ;
+- perce le NAT des deux box pour une connexion directe, chiffrée de bout en bout
+  (QUIC) ;
+- passe par un relais public si aucune connexion directe n'est possible (certains
+  opérateurs partagent une même IP entre plusieurs abonnés). Le relais ne voit
+  que des données chiffrées.
+
+La clé est gardée dans `~/.local/share/spotitogether/p2p-host.key` : ton lien
+reste le même d'une session à l'autre (seul le code change). Le serveur ne
+transporte que l'état du salon (file, position, membres) : aucun son ni jeton
+Spotify ne passe par lui.
+
+Les options ci-dessous servent seulement si tu ne veux pas dépendre des
+services publics d'iroh (`serve --no-p2p`) ou si tu héberges un salon permanent
+sur un serveur.
+
+## 1. Tailscale
 
 Aucun port à ouvrir, chiffrement WireGuard de bout en bout.
 

@@ -4,6 +4,7 @@
 
 pub mod clock;
 pub mod sync;
+pub mod tunnel;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,13 +44,31 @@ pub enum Error {
     Invite(String),
 }
 
-/// Parsed invite: `spotitogether://host[:port]/CODE`, `host[:port]/CODE`,
+/// Parsed invite: `spotitogether://<host key>/CODE` (peer-to-peer, see
+/// [`tunnel`]), `spotitogether://host[:port]/CODE`, `host[:port]/CODE`,
 /// `spotitogether+tls://host[:port]/CODE` (TLS, default port 443),
 /// or a raw `ws://` / `wss://` URL (code given separately).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Invite {
+    /// Direct WebSocket URL (empty for a peer-to-peer invite).
     pub ws_url: String,
     pub code: Option<String>,
+    /// Host key of a peer-to-peer invite.
+    pub peer: Option<String>,
+}
+
+impl Invite {
+    /// WebSocket URL to join, opening the peer-to-peer tunnel when needed
+    /// (keep the tunnel alive for the whole session).
+    pub async fn connect_url(&self) -> Result<(String, Option<tunnel::GuestTunnel>), tunnel::TunnelError> {
+        match &self.peer {
+            Some(id) => {
+                let t = tunnel::GuestTunnel::start(id).await?;
+                Ok((t.ws_url(), Some(t)))
+            }
+            None => Ok((self.ws_url.clone(), None)),
+        }
+    }
 }
 
 pub fn parse_invite(input: &str) -> Result<Invite, Error> {
@@ -58,7 +77,7 @@ pub fn parse_invite(input: &str) -> Result<Invite, Error> {
         let base = input.trim_end_matches('/');
         let has_path = base.splitn(4, '/').nth(3).is_some();
         let ws_url = if has_path { base.to_owned() } else { format!("{base}{WS_PATH}") };
-        return Ok(Invite { ws_url, code: None });
+        return Ok(Invite { ws_url, code: None, peer: None });
     }
     let (rest, tls) = match input.strip_prefix(INVITE_SCHEME_TLS) {
         Some(rest) => (rest, true),
@@ -71,9 +90,13 @@ pub fn parse_invite(input: &str) -> Result<Invite, Error> {
     if host.is_empty() || host.contains(char::is_whitespace) {
         return Err(Error::Invite(input.to_owned()));
     }
+    let code = code.map(|c| c.to_uppercase());
+    if tunnel::is_peer_id(host) {
+        return Ok(Invite { ws_url: String::new(), code, peer: Some(host.to_owned()) });
+    }
     let (scheme, default_port) = if tls { ("wss", 443) } else { ("ws", DEFAULT_PORT) };
     let host = if host.contains(':') { host.to_owned() } else { format!("{host}:{default_port}") };
-    Ok(Invite { ws_url: format!("{scheme}://{host}{WS_PATH}"), code: code.map(|c| c.to_uppercase()) })
+    Ok(Invite { ws_url: format!("{scheme}://{host}{WS_PATH}"), code, peer: None })
 }
 
 pub struct JoinOptions {
@@ -438,19 +461,23 @@ mod tests {
     #[test]
     fn parses_invites() {
         let i = parse_invite("spotitogether://salon.exemple.fr:7420/k7xq2m").unwrap();
-        assert_eq!(i, Invite { ws_url: "ws://salon.exemple.fr:7420/ws".into(), code: Some("K7XQ2M".into()) });
+        assert_eq!(i, Invite { ws_url: "ws://salon.exemple.fr:7420/ws".into(), code: Some("K7XQ2M".into()), peer: None });
 
         let i = parse_invite("192.168.1.20/K7XQ2M").unwrap();
         assert_eq!(i.ws_url, "ws://192.168.1.20:7420/ws");
 
         let i = parse_invite("wss://salon.exemple.fr").unwrap();
-        assert_eq!(i, Invite { ws_url: "wss://salon.exemple.fr/ws".into(), code: None });
+        assert_eq!(i, Invite { ws_url: "wss://salon.exemple.fr/ws".into(), code: None, peer: None });
 
         let i = parse_invite("ws://127.0.0.1:9000/ws").unwrap();
         assert_eq!(i.ws_url, "ws://127.0.0.1:9000/ws");
 
         let i = parse_invite("spotitogether+tls://salon.exemple.fr/k7xq2m").unwrap();
-        assert_eq!(i, Invite { ws_url: "wss://salon.exemple.fr:443/ws".into(), code: Some("K7XQ2M".into()) });
+        assert_eq!(i, Invite { ws_url: "wss://salon.exemple.fr:443/ws".into(), code: Some("K7XQ2M".into()), peer: None });
+
+        let key = iroh::SecretKey::generate().public().to_string();
+        let i = parse_invite(&format!("spotitogether://{key}/k7xq2m")).unwrap();
+        assert_eq!(i, Invite { ws_url: String::new(), code: Some("K7XQ2M".into()), peer: Some(key) });
 
         assert!(parse_invite("spotitogether:///CODE").is_err());
     }

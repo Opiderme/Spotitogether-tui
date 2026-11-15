@@ -14,7 +14,7 @@ use tokio::net::TcpListener;
 use tui::launcher::{Account, LauncherChoice, LauncherInfo};
 
 use crate::config::Config;
-use crate::room_cmd::{invite_link, lan_ip, load_host_token, local_port, open_store};
+use crate::room_cmd::{invite_host, invite_link, is_local_only, load_host_token, local_port, open_store, start_host_tunnel};
 use crate::{secrets, spotify_cmd};
 
 /// Ports tried, in order, when creating a room.
@@ -116,6 +116,30 @@ fn guest_name(profile: &Option<Profile>) -> String {
     }
 }
 
+/// `192.168.1.19` from `ws://192.168.1.19:7420/ws`.
+fn host_of(ws_url: &str) -> String {
+    let rest = ws_url.split("://").nth(1).unwrap_or(ws_url);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    authority.rsplit_once(':').map_or(authority, |(h, _)| h).to_owned()
+}
+
+/// Turns network errors into something actionable.
+fn explain(e: client::Error, host: &str, peer: bool) -> anyhow::Error {
+    match e {
+        client::Error::Ws(_) | client::Error::Protocol(_) if peer => {
+            anyhow::anyhow!("impossible de joindre l'hôte : son salon est fermé ou il est hors ligne")
+        }
+        client::Error::Ws(_) if is_local_only(host) => anyhow::anyhow!(
+            "impossible de joindre {host} : cette adresse n'existe que sur le réseau local de l'hôte. \
+             Demande-lui le lien affiché par « Créer un salon » : il marche depuis n'importe où."
+        ),
+        client::Error::Ws(_) => anyhow::anyhow!(
+            "impossible de joindre {host} : le salon est fermé, l'adresse est fausse, ou un pare-feu bloque le port"
+        ),
+        other => other.into(),
+    }
+}
+
 fn pause() {
     println!("\nAppuie sur Entrée pour revenir à l'accueil…");
     let _ = io::stdin().lock().read_line(&mut String::new());
@@ -134,8 +158,17 @@ async fn host(profile: Option<Profile>) -> Result<Option<String>> {
             None
         }
     };
-    let lan = lan_ip().map(|ip| ip.to_string()).unwrap_or_else(|| "127.0.0.1".into());
-    let invite = invite_link(None, false, &lan, port, &code);
+    // Peer-to-peer link (works from anywhere); LAN link if that fails.
+    let tunnel = start_host_tunnel(port).await;
+    let (invite, notice) = match &tunnel {
+        Ok(t) => (format!("spotitogether://{}/{code}", t.id()), None),
+        Err(e) => {
+            tracing::warn!(%e, "peer-to-peer unavailable");
+            let (address, _) = invite_host();
+            let notice = format!("Accès Internet indisponible ({e:#}) : ce lien ne marche que sur ton réseau local");
+            (invite_link(None, false, &address, port, &code), Some(notice))
+        }
+    };
 
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(server::serve_until(listener, code.clone(), host_token.clone(), store, async {
@@ -156,12 +189,15 @@ async fn host(profile: Option<Profile>) -> Result<Option<String>> {
     )
     .await;
     let result = match joined {
-        Ok(joined) => tui::run(joined, spotify, tui::RunOptions { invite: Some(invite), hosting: true }).await,
+        Ok(joined) => tui::run(joined, spotify, tui::RunOptions { invite: Some(invite), hosting: true, notice }).await,
         Err(e) => Err(e.into()),
     };
 
     let _ = stop.send(());
     let _ = tokio::time::timeout(Duration::from_secs(3), server).await;
+    if let Ok(t) = tunnel {
+        t.close().await;
+    }
     result
 }
 
@@ -181,11 +217,14 @@ async fn join(invite_text: &str, profile: Option<Profile>) -> Result<Option<Stri
     // A `serve` running on this machine: get the host role, as `join` does.
     let host_token = local_port(&invite.ws_url).and_then(load_host_token);
 
-    println!("Connexion à {}…", invite.ws_url);
+    let host = invite.peer.clone().unwrap_or_else(|| host_of(&invite.ws_url));
+    println!("Connexion au salon…");
+    // Peer-to-peer invite: the tunnel lives as long as this session.
+    let (ws_url, tunnel) = invite.connect_url().await?;
     let spotify = profile.as_ref().map(|(sp, _)| sp.clone());
     let joined = client::join(
         JoinOptions {
-            ws_url: invite.ws_url,
+            ws_url,
             code,
             name: guest_name(&profile),
             host_token,
@@ -194,7 +233,12 @@ async fn join(invite_text: &str, profile: Option<Profile>) -> Result<Option<Stri
         },
         spotify.clone(),
     )
-    .await?;
-    let options = tui::RunOptions { invite: Some(invite_text.to_owned()), hosting: false };
-    tui::run(joined, spotify, options).await
+    .await
+    .map_err(|e| explain(e, &host, invite.peer.is_some()))?;
+    let options = tui::RunOptions { invite: Some(invite_text.to_owned()), hosting: false, notice: None };
+    let result = tui::run(joined, spotify, options).await;
+    if let Some(t) = tunnel {
+        t.close().await;
+    }
+    result
 }

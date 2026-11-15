@@ -66,6 +66,9 @@ enum Command {
         /// Le salon est derrière un reverse proxy HTTPS (invitation en wss://)
         #[arg(long, requires = "public")]
         tls: bool,
+        /// Désactiver l'accès pair-à-pair (lien qui marche hors du réseau local)
+        #[arg(long)]
+        no_p2p: bool,
     },
     /// Rejoint un salon : spotitogether join spotitogether://hôte:port/CODE
     Join {
@@ -118,8 +121,8 @@ async fn run(cli: Cli) -> Result<()> {
             println!("Jeton Spotify supprimé.");
             Ok(())
         }
-        Command::Serve { port, bind, code, data, ephemeral, public, tls } => {
-            room_cmd::serve(room_cmd::ServeArgs { port, bind, code, data, ephemeral, public, tls }).await
+        Command::Serve { port, bind, code, data, ephemeral, public, tls, no_p2p } => {
+            room_cmd::serve(room_cmd::ServeArgs { port, bind, code, data, ephemeral, public, tls, no_p2p }).await
         }
         Command::Join { invite, code, name, host_token, guest, spectator, plain } => {
             room_cmd::join(room_cmd::JoinArgs { invite, code, name, host_token, guest, spectator, plain }).await

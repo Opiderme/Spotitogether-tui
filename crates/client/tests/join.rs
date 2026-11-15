@@ -158,3 +158,45 @@ async fn closing_the_room_disconnects_members_for_good() {
     assert!(reason.contains("fermé"), "{reason}");
     tokio::time::timeout(Duration::from_secs(5), server).await.expect("server stops").unwrap().unwrap();
 }
+
+/// Real peer-to-peer path through iroh's public lookup service and relays:
+/// needs Internet, so not run by default (`cargo test -- --ignored`).
+#[tokio::test]
+#[ignore]
+async fn joins_over_the_peer_to_peer_tunnel() {
+    use client::tunnel::{GuestTunnel, HostTunnel, generate_secret, is_peer_id};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = listener.local_addr().unwrap();
+    tokio::spawn(server::serve(listener, "ABC234".into(), "tok".into(), None));
+
+    let host = HostTunnel::start(generate_secret(), local).await.unwrap();
+    assert!(host.online().await, "host should reach the relay");
+    let id = host.id();
+    assert!(is_peer_id(&id));
+
+    let guest = GuestTunnel::start(&id).await.unwrap();
+    let mut joined = join(JoinOptions { host_token: None, name: "Pair".into(), ..opts(&guest.ws_url(), "ABC234") }, None)
+        .await
+        .expect("join through the tunnel");
+    assert_eq!(joined.room.settings.code, "ABC234");
+
+    // Commands flow both ways through the tunnel.
+    let track = TrackInfo { uri: "spotify:track:1".into(), name: "T".into(), artists: "A".into(), duration_ms: 60_000, album_uri: None, cover_url: None };
+    let host_client = join(opts(&guest.ws_url(), "ABC234"), None).await.unwrap();
+    host_client.handle.send(ClientMsg::QueueAdd { track });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(Event::Server(msg)) = joined.events.recv().await
+                && let ServerMsg::Playback(p) = *msg
+                && p.is_playing
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("playback received through the tunnel");
+    guest.close().await;
+    host.close().await;
+}

@@ -188,7 +188,8 @@ impl Launcher {
         let t = self.theme;
         let area = f.area();
         let w = 74.min(area.width);
-        let h = (self.items.len() as u16 * 2 + 12).min(area.height);
+        let extra = if self.message.is_some() { 3 } else { 0 };
+        let h = (self.items.len() as u16 * 2 + 12 + extra).min(area.height);
         let card = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
         f.render_widget(Clear, card);
         let block = Block::bordered()
