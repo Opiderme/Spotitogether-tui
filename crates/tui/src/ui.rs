@@ -290,14 +290,19 @@ fn draw_search(f: &mut Frame, app: &mut App, area: Rect) {
         spans.push(Span::raw("tape / pour chercher un titre, un artiste…").fg(t.muted));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), input);
-    if s.total > SEARCH_PAGE && !s.editing {
+    if s.total > SEARCH_PAGE && !s.editing && !s.loading {
         let page = format!("page {}/{} · [ ] ", s.offset / SEARCH_PAGE + 1, s.total.div_ceil(SEARCH_PAGE));
         f.render_widget(Paragraph::new(Line::from(page).fg(t.muted)).alignment(Alignment::Right), input);
     }
 
-    if s.loading {
+    // While typing, keep the previous results on screen until the new ones
+    // arrive (no flicker); the spinner only shows on an empty list.
+    if s.loading && s.results.is_empty() {
         f.render_widget(Paragraph::new(Line::from("Recherche…").fg(t.muted)), results);
         return;
+    }
+    if s.loading {
+        f.render_widget(Paragraph::new(Line::from("recherche… ").fg(t.muted)).alignment(Alignment::Right), input);
     }
     let rows = s.results.iter().map(|track| {
         Row::new::<Vec<ratatui::widgets::Cell>>(vec![

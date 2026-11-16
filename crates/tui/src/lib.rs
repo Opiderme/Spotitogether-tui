@@ -199,6 +199,7 @@ async fn event_loop(
                 Loaded::LibraryList { key, result } => { app.on_library_list(key, result); vec![] }
             },
             Some(cmd) = mpris_cmd_rx.recv() => app.on_mpris(cmd),
+            _ = sleep_until_opt(app.search_due()) => app.on_search_due(),
             _ = frame.tick() => {
                 frames += 1;
                 // Position refresh for MPRIS clients, once per second.
@@ -208,6 +209,13 @@ async fn event_loop(
                 vec![]
             }
         };
+    }
+}
+
+async fn sleep_until_opt(deadline: Option<std::time::Instant>) {
+    match deadline {
+        Some(d) => tokio::time::sleep_until(d.into()).await,
+        None => std::future::pending().await,
     }
 }
 

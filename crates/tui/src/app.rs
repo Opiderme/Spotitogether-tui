@@ -17,6 +17,9 @@ use crate::theme::Theme;
 const SEEK_STEP_MS: u64 = 10_000;
 const TOAST_FOR: Duration = Duration::from_secs(5);
 pub const SEARCH_PAGE: u32 = 10;
+/// Search-as-you-type: delay after the last key press, so a fast typist
+/// sends one request per pause rather than one per character (API quota).
+pub const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
@@ -122,6 +125,8 @@ pub struct Search {
     pub total: u32,
     pub loading: bool,
     request: u64,
+    /// When the typed text should be searched (search-as-you-type).
+    pub due: Option<Instant>,
 }
 
 pub struct SearchOutcome {
@@ -417,6 +422,7 @@ impl App {
             TermEvent::Mouse(mouse) => self.on_mouse(mouse),
             TermEvent::Paste(text) if self.search.editing => {
                 self.search.input.push_str(text.trim());
+                self.input_changed();
                 vec![]
             }
             _ => vec![],
@@ -542,17 +548,27 @@ impl App {
                 self.focus = self.focus.next();
             }
             KeyCode::Enter => {
+                // Leave the field to browse the results; search now if they
+                // do not match the text yet.
                 self.search.editing = false;
+                self.search.due = None;
                 let query = self.search.input.trim().to_owned();
-                if !query.is_empty() {
+                if !query.is_empty() && (query != self.search.query || self.search.offset != 0) {
                     return self.start_search(query, 0);
                 }
             }
             KeyCode::Backspace => {
                 self.search.input.pop();
+                self.input_changed();
             }
-            KeyCode::Down => self.search.editing = false,
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => self.search.input.push(c),
+            KeyCode::Down => {
+                self.search.editing = false;
+                self.search.due = None;
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.search.input.push(c);
+                self.input_changed();
+            }
             _ => {}
         }
         vec![]
@@ -714,6 +730,39 @@ impl App {
         self.queue.insert(to, item);
         self.queue_state.select(Some(to));
         vec![Effect::Send(ClientMsg::QueueMove { id, index: to })]
+    }
+
+    /// The search text changed: schedule a search, or clear the results.
+    fn input_changed(&mut self) {
+        if self.search.input.trim().is_empty() {
+            self.search.due = None;
+            self.search.request += 1; // drop answers still in flight
+            self.search.loading = false;
+            self.search.query.clear();
+            self.search.results.clear();
+            self.search.state.select(None);
+            self.search.total = 0;
+        } else {
+            self.search.due = Some(Instant::now() + SEARCH_DEBOUNCE);
+        }
+    }
+
+    /// Deadline of the pending search-as-you-type request, if any.
+    pub fn search_due(&self) -> Option<Instant> {
+        self.search.due
+    }
+
+    /// Runs the pending search once its delay is over.
+    pub fn on_search_due(&mut self) -> Vec<Effect> {
+        if self.search.due.is_none_or(|t| Instant::now() < t) {
+            return vec![];
+        }
+        self.search.due = None;
+        let query = self.search.input.trim().to_owned();
+        if query.is_empty() || (query == self.search.query && self.search.offset == 0) {
+            return vec![];
+        }
+        self.start_search(query, 0)
     }
 
     fn start_search(&mut self, query: String, offset: u32) -> Vec<Effect> {
@@ -1286,6 +1335,38 @@ mod tests {
         let fx = a.on_key(key(KeyCode::Enter));
         assert_eq!(fx, [Effect::Search { request: 1, query: "daft".into(), offset: 0 }]);
         assert!(!a.search.editing);
+    }
+
+    #[test]
+    fn search_as_you_type_waits_for_a_pause() {
+        let mut a = app();
+        a.on_key(key(KeyCode::Char('/')));
+        for c in "daf".chars() {
+            a.on_key(key(KeyCode::Char(c)));
+        }
+        // Too early: still typing.
+        assert!(a.on_search_due().is_empty());
+        assert!(a.search_due().is_some());
+
+        // After the pause, one request for the whole text.
+        a.search.due = Some(Instant::now() - Duration::from_millis(1));
+        assert_eq!(a.on_search_due(), [Effect::Search { request: 1, query: "daf".into(), offset: 0 }]);
+        assert!(a.search.editing, "still typing");
+        assert!(a.on_search_due().is_empty(), "nothing pending");
+
+        // Results for that text: Enter only leaves the field.
+        a.on_search(SearchOutcome { request: 1, offset: 0, result: Ok((vec![Track::default()], 1)) });
+        assert!(a.on_key(key(KeyCode::Enter)).is_empty());
+        assert!(!a.search.editing);
+
+        // Clearing the text clears the results and ignores late answers.
+        a.on_key(key(KeyCode::Char('/')));
+        for _ in 0..3 {
+            a.on_key(key(KeyCode::Backspace));
+        }
+        assert!(a.search.results.is_empty() && a.search_due().is_none());
+        a.on_search(SearchOutcome { request: 1, offset: 0, result: Ok((vec![Track::default()], 1)) });
+        assert!(a.search.results.is_empty());
     }
 
     #[test]
