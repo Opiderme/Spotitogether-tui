@@ -58,6 +58,8 @@ Dans un salon, l'interface plein écran se pilote au clavier et à la souris :
 | `l` | ta bibliothèque (titres likés, playlists) : ajouter un titre (Entrée), toute la liste (`t`), la jouer tout de suite dans l'ordre (`p`) ou en aléatoire (`s`) |
 | espace, `s`, ← → | lecture/pause du salon, morceau suivant, ±10 s |
 | `j` `k`, `J` `K`, `d` | sélection, déplacement et retrait dans la file |
+| `+` `-`, `m` | ton volume, muet pour le titre en cours (toi seul ; le son revient au suivant) |
+| `f` | j'aime / je n'aime plus (titre en cours, ou sélectionné dans la recherche et la bibliothèque) |
 | `r` | resynchroniser ton Spotify |
 | `c` | pochette en ASCII, en blocs colorés ou en vraie image (Sixel/Kitty) |
 | `p` | permissions des membres (hôte) |

@@ -20,6 +20,9 @@ pub const SEARCH_PAGE: u32 = 10;
 /// Search-as-you-type: delay after the last key press, so a fast typist
 /// sends one request per pause rather than one per character (API quota).
 pub const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
+/// Volume keys: one request after a short pause, not one per key press.
+pub const VOLUME_DEBOUNCE: Duration = Duration::from_millis(200);
+const VOLUME_STEP: u8 = 5;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
@@ -27,6 +30,14 @@ pub enum Effect {
     Search { request: u64, query: String, offset: u32 },
     FetchCover(String),
     LoadPlaylists,
+    /// This member's own volume (only they hear it).
+    SetVolume(u8),
+    /// Read the current volume of the member's player.
+    LoadVolume,
+    /// Which of these tracks are in the member's liked songs.
+    CheckLiked(Vec<String>),
+    /// Like / unlike a track for this member.
+    SetLiked { uri: String, name: String, liked: bool },
     /// The member's playlists, for the library.
     LoadLibrary,
     /// Tracks of a library list.
@@ -90,6 +101,8 @@ pub struct Areas {
     pub picker_rows: Rect,
     pub library_popup: Rect,
     pub library_rows: Rect,
+    pub like_button: Rect,
+    pub volume_bar: Rect,
     pub perm_cols: [(u16, u16); PERM_COLUMNS],
 }
 
@@ -155,6 +168,13 @@ pub struct App {
     pub perm_panel: Option<PermPanel>,
     pub playlist_picker: Option<PlaylistPicker>,
     pub library: Option<crate::library::Library>,
+    /// This member's volume (None until read from Spotify).
+    pub volume: Option<u8>,
+    /// Muted for the current track only: (item id, volume to restore).
+    pub muted: Option<(protocol::ItemId, u8)>,
+    pub volume_due: Option<Instant>,
+    /// Liked state of tracks seen so far (by URI).
+    pub liked: std::collections::HashMap<String, bool>,
     pub me: MemberId,
     pub playback: Playback,
     pub queue: Vec<QueueItem>,
@@ -197,6 +217,10 @@ impl App {
             perm_panel: None,
             playlist_picker: None,
             library: None,
+            volume: None,
+            muted: None,
+            volume_due: None,
+            liked: std::collections::HashMap::new(),
             me: joined.member_id,
             playback: room.playback.clone(),
             queue: room.queue.clone(),
@@ -230,7 +254,21 @@ impl App {
 
     /// Effects to run right after start (cover of the current track).
     pub fn initial_effects(&self) -> Vec<Effect> {
-        self.cover_url().map(|u| Effect::FetchCover(u.to_owned())).into_iter().collect()
+        let mut fx: Vec<Effect> = self.cover_url().map(|u| Effect::FetchCover(u.to_owned())).into_iter().collect();
+        if self.can_play {
+            fx.push(Effect::LoadVolume);
+            fx.extend(self.current_uri().map(|u| Effect::CheckLiked(vec![u])));
+        }
+        fx
+    }
+
+    fn current_uri(&self) -> Option<String> {
+        self.playback.current.as_ref().map(|i| i.track.uri.clone())
+    }
+
+    /// Liked state of the current track, if known.
+    pub fn current_liked(&self) -> Option<bool> {
+        self.current_uri().and_then(|u| self.liked.get(&u).copied())
     }
 
     pub fn me(&self) -> Option<&Member> {
@@ -315,14 +353,21 @@ impl App {
         match msg {
             ServerMsg::Playback(p) => {
                 let old_url = self.cover_url().map(str::to_owned);
+                let old_item = self.playback.current.as_ref().map(|i| i.id);
                 self.playback = p;
+                let mut fx = Vec::new();
+                let new_item = self.playback.current.as_ref().map(|i| i.id);
+                if new_item != old_item {
+                    fx.extend(self.on_track_changed(new_item));
+                }
                 let new_url = self.cover_url().map(str::to_owned);
                 if new_url != old_url {
                     self.cover = None;
                     self.cover_cache = None;
                     self.cover_image = None;
-                    return new_url.map(Effect::FetchCover).into_iter().collect();
+                    fx.extend(new_url.map(Effect::FetchCover));
                 }
+                return fx;
             }
             ServerMsg::Queue { items } => {
                 self.queue = items;
@@ -395,13 +440,142 @@ impl App {
         }
     }
 
-    pub fn on_search(&mut self, outcome: SearchOutcome) {
-        if outcome.request != self.search.request {
-            return; // stale
+    /// New track: lift a per-track mute, refresh the liked state.
+    fn on_track_changed(&mut self, item: Option<protocol::ItemId>) -> Vec<Effect> {
+        if !self.can_play {
+            return vec![];
         }
+        let mut fx = Vec::new();
+        if let Some((muted_item, restore)) = self.muted
+            && Some(muted_item) != item
+        {
+            self.muted = None;
+            self.volume = Some(restore);
+            self.volume_due = None;
+            self.toast("Son rétabli pour ce titre", Level::Info);
+            fx.push(Effect::SetVolume(restore));
+        }
+        if let Some(uri) = self.current_uri().filter(|u| !self.liked.contains_key(u)) {
+            fx.push(Effect::CheckLiked(vec![uri]));
+        }
+        fx
+    }
+
+    pub fn on_volume(&mut self, volume: Option<u8>) {
+        if self.volume_due.is_none() && self.muted.is_none() {
+            self.volume = volume;
+        }
+    }
+
+    pub fn on_liked(&mut self, states: Vec<(String, bool)>) {
+        self.liked.extend(states);
+    }
+
+    pub fn on_like_done(&mut self, uri: String, name: String, liked: bool, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                self.liked.insert(uri, liked);
+                let text = if liked { format!("♥ « {name} » ajouté à tes titres likés") } else { format!("« {name} » retiré de tes titres likés") };
+                self.toast(text, Level::Good);
+            }
+            Err(e) => self.toast(format!("J'aime : {e}"), Level::Bad),
+        }
+    }
+
+    // ------------------------------------------------- volume and likes
+
+    fn needs_account(&mut self, what: &str) -> bool {
+        if !self.can_play {
+            self.toast(format!("{what} nécessite ton compte Spotify (pas en mode spectateur)"), Level::Warn);
+        }
+        self.can_play
+    }
+
+    /// Changes this member's volume; sent after a short pause.
+    fn change_volume(&mut self, delta: i16) -> Vec<Effect> {
+        if !self.needs_account("Le volume") {
+            return vec![];
+        }
+        let base = match self.muted.take() {
+            Some((_, restore)) => restore, // any change ends the mute
+            None => self.volume.unwrap_or(50),
+        };
+        self.set_volume((i16::from(base) + delta).clamp(0, 100) as u8)
+    }
+
+    fn set_volume(&mut self, percent: u8) -> Vec<Effect> {
+        self.muted = None;
+        self.volume = Some(percent);
+        self.volume_due = Some(Instant::now() + VOLUME_DEBOUNCE);
+        vec![]
+    }
+
+    pub fn volume_due(&self) -> Option<Instant> {
+        self.volume_due
+    }
+
+    pub fn on_volume_due(&mut self) -> Vec<Effect> {
+        if self.volume_due.is_none_or(|t| Instant::now() < t) {
+            return vec![];
+        }
+        self.volume_due = None;
+        self.volume.map(Effect::SetVolume).into_iter().collect()
+    }
+
+    /// Mutes this member until the next track (or unmutes).
+    fn toggle_mute(&mut self) -> Vec<Effect> {
+        if !self.needs_account("Le mute") {
+            return vec![];
+        }
+        if let Some((_, restore)) = self.muted.take() {
+            self.volume = Some(restore);
+            self.toast("Son rétabli", Level::Info);
+            return vec![Effect::SetVolume(restore)];
+        }
+        let Some(item) = self.playback.current.as_ref().map(|i| i.id) else {
+            self.toast("Rien à couper : aucun titre en cours", Level::Info);
+            return vec![];
+        };
+        let restore = self.volume.unwrap_or(50).max(1);
+        self.muted = Some((item, restore));
+        self.volume_due = None;
+        self.toast("Muet pour ce titre (chez toi seulement) : le son revient au suivant", Level::Info);
+        vec![Effect::SetVolume(0)]
+    }
+
+    /// Likes or unlikes a track for this member.
+    fn toggle_like(&mut self, uri: String, name: String) -> Vec<Effect> {
+        if !self.needs_account("J'aime") {
+            return vec![];
+        }
+        let liked = !self.liked.get(&uri).copied().unwrap_or(false);
+        vec![Effect::SetLiked { uri, name, liked }]
+    }
+
+    fn like_current(&mut self) -> Vec<Effect> {
+        match self.playback.current.as_ref().map(|i| (i.track.uri.clone(), i.track.name.clone())) {
+            Some((uri, name)) => self.toggle_like(uri, name),
+            None => {
+                self.toast("Aucun titre en cours", Level::Info);
+                vec![]
+            }
+        }
+    }
+
+    /// Search results; returns the liked-state check of the new tracks.
+    pub fn on_search(&mut self, outcome: SearchOutcome) -> Vec<Effect> {
+        if outcome.request != self.search.request {
+            return vec![]; // stale
+        }
+        let mut fx = Vec::new();
         self.search.loading = false;
         match outcome.result {
             Ok((tracks, total)) => {
+                let unknown: Vec<String> =
+                    tracks.iter().map(|t| t.uri.clone()).filter(|u| !self.liked.contains_key(u)).collect();
+                if self.can_play && !unknown.is_empty() {
+                    fx.push(Effect::CheckLiked(unknown));
+                }
                 self.search.results = tracks;
                 self.search.total = total;
                 self.search.offset = outcome.offset;
@@ -412,6 +586,7 @@ impl App {
             }
             Err(e) => self.toast(format!("Recherche : {e}"), Level::Bad),
         }
+        fx
     }
 
     // ---------------------------------------------------------- input
@@ -474,6 +649,16 @@ impl App {
             KeyCode::Char(' ') => return self.toggle_play(),
             KeyCode::Char('s') => return self.skip_or_vote(),
             KeyCode::Char('l') => return self.open_library(),
+            KeyCode::Char('+') | KeyCode::Char('=') => return self.change_volume(i16::from(VOLUME_STEP)),
+            KeyCode::Char('-') => return self.change_volume(-i16::from(VOLUME_STEP)),
+            KeyCode::Char('m') => return self.toggle_mute(),
+            KeyCode::Char('f') if self.focus == Focus::Search => {
+                if let Some(t) = self.search.state.selected().and_then(|i| self.search.results.get(i)).cloned() {
+                    return self.toggle_like(t.uri, t.name);
+                }
+                return self.like_current();
+            }
+            KeyCode::Char('f') => return self.like_current(),
             KeyCode::Char('A') => {
                 if !self.is_host() {
                     self.toast("L'autoplay est choisi par l'hôte", Level::Warn);
@@ -603,6 +788,13 @@ impl App {
                 if a.next_button.contains(pos) {
                     return self.skip_or_vote();
                 }
+                if a.like_button.contains(pos) {
+                    return self.like_current();
+                }
+                if a.volume_bar.contains(pos) && a.volume_bar.width > 1 && self.needs_account("Le volume") {
+                    let frac = f64::from(pos.x - a.volume_bar.x) / f64::from(a.volume_bar.width - 1);
+                    return self.set_volume((frac.clamp(0.0, 1.0) * 100.0).round() as u8);
+                }
                 if a.progress.contains(pos) && a.progress.width > 0 {
                     if let Some(item) = &self.playback.current {
                         let frac = f64::from(pos.x - a.progress.x) / f64::from(a.progress.width.saturating_sub(1).max(1));
@@ -657,6 +849,9 @@ impl App {
             }
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                 let down = m.kind == MouseEventKind::ScrollDown;
+                if a.volume_bar.contains(pos) {
+                    return self.change_volume(if down { -i16::from(VOLUME_STEP) } else { i16::from(VOLUME_STEP) });
+                }
                 if a.queue.contains(pos) {
                     scroll(&mut self.queue_state, self.queue.len(), down);
                 } else if a.search.contains(pos) {
@@ -848,7 +1043,12 @@ impl App {
         match result {
             Ok(tracks) => {
                 open.state.select((!tracks.is_empty()).then_some(0));
+                let liked_list = open.key == "liked";
+                let uris: Vec<String> = tracks.iter().map(|t| t.uri.clone()).collect();
                 open.tracks = tracks;
+                if liked_list {
+                    self.liked.extend(uris.into_iter().map(|u| (u, true)));
+                }
             }
             Err(e) => {
                 let text = format!("« {} » : {e}", open.name);
@@ -899,6 +1099,13 @@ impl App {
                 }
                 KeyCode::Enter | KeyCode::Char('a') => self.add_library_track(),
                 KeyCode::Char('t') => self.add_library_list(AddMode::End, false),
+                KeyCode::Char('f') => {
+                    let track = open.state.selected().and_then(|i| open.tracks.get(i)).cloned();
+                    match track {
+                        Some(t) => self.toggle_like(t.uri, t.name),
+                        None => vec![],
+                    }
+                }
                 KeyCode::Char('p') => self.add_library_list(AddMode::PlayNow, false),
                 KeyCode::Char('s') => self.add_library_list(AddMode::PlayNow, true),
                 _ => vec![],
@@ -1408,7 +1615,7 @@ mod tests {
         p.seq = 2;
         p.current = Some(item(9));
         let fx = a.on_room_event(Event::Server(Box::new(ServerMsg::Playback(p))));
-        assert_eq!(fx, [Effect::FetchCover("https://i.scdn.co/image/9".into())]);
+        assert_eq!(fx, [Effect::CheckLiked(vec!["spotify:track:9".into()]), Effect::FetchCover("https://i.scdn.co/image/9".into())]);
         assert_eq!(a.on_room_event(Event::Disconnected("bye".into())), [Effect::Quit]);
         assert_eq!(a.exit_message.as_deref(), Some("bye"));
     }
@@ -1637,5 +1844,70 @@ mod tests {
         for needle in ["Bibliothèque › Klassique", "1 titres (les 1 premiers sur 92)", "Cello Suite No. 1", "jouer en aléatoire"] {
             assert!(text.contains(needle), "{needle} missing");
         }
+    }
+
+    #[test]
+    fn volume_is_debounced_and_mute_lasts_one_track() {
+        let mut a = app();
+        a.on_volume(Some(40));
+        assert!(a.on_key(key(KeyCode::Char('+'))).is_empty());
+        a.on_key(key(KeyCode::Char('+')));
+        assert_eq!(a.volume, Some(50));
+        assert!(a.on_volume_due().is_empty(), "waits for a pause");
+        a.volume_due = Some(Instant::now() - Duration::from_millis(1));
+        assert_eq!(a.on_volume_due(), [Effect::SetVolume(50)]);
+
+        // Mute: immediate, for this track only.
+        assert_eq!(a.on_key(key(KeyCode::Char('m'))), [Effect::SetVolume(0)]);
+        let mut p = a.playback.clone();
+        p.seq += 1;
+        p.position_ms = 5_000; // same track (seek): still muted
+        assert!(!a.on_room_event(Event::Server(Box::new(ServerMsg::Playback(p.clone())))).contains(&Effect::SetVolume(50)));
+        assert!(a.muted.is_some());
+        p.seq += 1;
+        p.current = Some(item(7));
+        let fx = a.on_room_event(Event::Server(Box::new(ServerMsg::Playback(p))));
+        assert!(fx.contains(&Effect::SetVolume(50)), "sound back on the next track: {fx:?}");
+        assert!(a.muted.is_none());
+        assert!(fx.contains(&Effect::CheckLiked(vec!["spotify:track:7".into()])));
+
+        // m twice: unmute right away.
+        a.on_key(key(KeyCode::Char('m')));
+        assert_eq!(a.on_key(key(KeyCode::Char('m'))), [Effect::SetVolume(50)]);
+    }
+
+    #[test]
+    fn like_button_toggles_for_the_current_track() {
+        let mut a = app();
+        a.areas.like_button = Rect::new(30, 5, 5, 1);
+        let click = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 31, row: 5, modifiers: KeyModifiers::NONE };
+        assert_eq!(a.on_mouse(click), [Effect::SetLiked { uri: "spotify:track:1".into(), name: "T1".into(), liked: true }]);
+        a.on_like_done("spotify:track:1".into(), "T1".into(), true, Ok(()));
+        assert_eq!(a.current_liked(), Some(true));
+        assert_eq!(a.on_key(key(KeyCode::Char('f'))), [Effect::SetLiked { uri: "spotify:track:1".into(), name: "T1".into(), liked: false }]);
+
+        // Spectators have no Spotify account.
+        a.can_play = false;
+        assert!(a.on_key(key(KeyCode::Char('f'))).is_empty());
+        assert!(a.on_key(key(KeyCode::Char('m'))).is_empty());
+    }
+
+    #[test]
+    fn renders_like_button_and_volume() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut a = app();
+        a.on_volume(Some(27));
+        a.on_liked(vec![("spotify:track:1".into(), true)]);
+        let mut terminal = Terminal::new(TestBackend::new(110, 34)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut a)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_owned()).collect::<String>() + "\n")
+            .collect();
+        println!("{text}");
+        assert!(text.contains("[ ♥ ]"), "like button");
+        assert!(text.contains("27 %  (+/- · m muet)"), "volume");
+        assert!(a.areas.like_button.width > 0 && a.areas.volume_bar.width > 5);
     }
 }

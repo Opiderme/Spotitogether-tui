@@ -15,6 +15,8 @@ use crate::{Error, Result};
 const API: &str = "https://api.spotify.com/v1";
 /// Development Mode caps `limit` on /search at 10 since February 2026.
 pub const SEARCH_MAX_LIMIT: u32 = 10;
+/// URIs per /me/library request.
+const LIBRARY_BATCH: usize = 40;
 const MAX_RATE_LIMIT_RETRIES: u32 = 3;
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
 
@@ -131,6 +133,20 @@ impl SpotifyClient {
         Ok(())
     }
 
+    /// Volume of this account's player (0–100). Only this member hears it.
+    pub async fn set_volume(&self, device_id: Option<&str>, percent: u8) -> Result<()> {
+        let mut query = device_query(device_id);
+        query.push(("volume_percent", percent.min(100).to_string()));
+        self.request(Method::PUT, "/me/player/volume", &query, None).await?;
+        Ok(())
+    }
+
+    /// Current volume of the active device, if it reports one.
+    pub async fn volume(&self) -> Result<Option<u8>> {
+        let devices = self.devices().await?;
+        Ok(devices.iter().find(|d| d.is_active).or(devices.first()).filter(|d| d.supports_volume).and_then(|d| d.volume_percent))
+    }
+
     /// Moves playback to `device_id`.
     pub async fn transfer(&self, device_id: &str, play: bool) -> Result<()> {
         let body = json!({ "device_ids": [device_id], "play": play });
@@ -159,6 +175,28 @@ impl SpotifyClient {
 
     pub async fn track(&self, id: &str) -> Result<Track> {
         self.get_json(&format!("/tracks/{id}"), &[]).await
+    }
+
+    // -------------------------------------------------------------- library
+
+    /// Which of `uris` are in the user's library (liked), in order.
+    /// Spotify accepts 40 URIs per request; longer lists are split.
+    pub async fn library_contains(&self, uris: &[String]) -> Result<Vec<bool>> {
+        let mut out = Vec::with_capacity(uris.len());
+        for chunk in uris.chunks(LIBRARY_BATCH) {
+            let flags: Vec<bool> = self.get_json("/me/library/contains", &[("uris", chunk.join(","))]).await?;
+            out.extend(flags);
+        }
+        Ok(out)
+    }
+
+    /// Adds tracks to the user's liked songs (or removes them).
+    pub async fn set_liked(&self, uris: &[String], liked: bool) -> Result<()> {
+        let method = if liked { Method::PUT } else { Method::DELETE };
+        for chunk in uris.chunks(LIBRARY_BATCH) {
+            self.request(method.clone(), "/me/library", &[("uris", chunk.join(","))], None).await?;
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------ playlists

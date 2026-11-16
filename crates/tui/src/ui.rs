@@ -14,6 +14,8 @@ const PREV: &str = "[ |◀ ]";
 const NEXT: &str = "[ ▶| ]";
 const PAUSE: &str = "[ ▮▮ ]";
 const PLAY: &str = "[ ▶  ]";
+const LIKED: &str = "[ ♥ ]";
+const NOT_LIKED: &str = "[ ♡ ]";
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -86,6 +88,8 @@ fn draw_now_playing(f: &mut Frame, app: &mut App, area: Rect) {
         app.areas.prev_button = Rect::default();
         app.areas.play_button = Rect::default();
         app.areas.next_button = Rect::default();
+        app.areas.like_button = Rect::default();
+        app.areas.volume_bar = Rect::default();
         let lines = vec![
             Line::default(),
             Line::from("Rien en lecture").fg(t.text).bold(),
@@ -125,6 +129,10 @@ fn draw_now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     // Buttons
     let buttons = line(8);
     let play = if app.playback.is_playing { PAUSE } else { PLAY };
+    let like = match app.current_liked() {
+        Some(true) => Span::raw(LIKED).fg(t.bad).bold(),
+        _ => Span::raw(NOT_LIKED).fg(t.text),
+    };
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::raw(PREV).fg(t.text),
@@ -132,6 +140,8 @@ fn draw_now_playing(f: &mut Frame, app: &mut App, area: Rect) {
             Span::raw(play).fg(t.accent).bold(),
             Span::raw("  "),
             Span::raw(NEXT).fg(t.text),
+            Span::raw("    "),
+            like,
             Span::raw(match app.votes {
                 (0, _) if app.my_perms().skip => String::new(),
                 (votes, needed) => format!("      vote skip {votes}/{needed}"),
@@ -144,6 +154,35 @@ fn draw_now_playing(f: &mut Frame, app: &mut App, area: Rect) {
     app.areas.prev_button = button(0);
     app.areas.play_button = button(8);
     app.areas.next_button = button(16);
+    app.areas.like_button = Rect { width: 7, ..button(26) };
+
+    // This member's volume: "Volume ━━━━━●────── 27 %  (+/- · m muet)"
+    let volume_row = Rect { width: line(9).width.min(72), ..line(9) };
+    if app.can_play {
+        let label = "Volume ";
+        let bar_w = volume_row.width.saturating_sub(label.len() as u16 + 28).min(30);
+        let (text, level) = match (app.muted, app.volume) {
+            (Some(_), _) => ("muet pour ce titre (m pour rétablir)".to_owned(), 0),
+            (None, Some(v)) => (format!("{v} %  (+/- · m muet)"), v),
+            (None, None) => ("— (+/- · m muet)".to_owned(), 0),
+        };
+        let done = (f64::from(level) / 100.0 * f64::from(bar_w.saturating_sub(1))).round() as usize;
+        let rest = (bar_w as usize).saturating_sub(done + 1);
+        let color = if app.muted.is_some() { t.warn } else { t.accent };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw(label).fg(t.muted),
+                Span::raw("━".repeat(done)).fg(color),
+                Span::raw("●").fg(color),
+                Span::raw("─".repeat(rest)).fg(t.border),
+                Span::raw(format!(" {text}")).fg(if app.muted.is_some() { t.warn } else { t.muted }),
+            ])),
+            volume_row,
+        );
+        app.areas.volume_bar = Rect { x: volume_row.x + label.len() as u16, width: bar_w, ..volume_row };
+    } else {
+        app.areas.volume_bar = Rect::default();
+    }
 
     let footer = if app.can_play && !app.my_perms().listen {
         "Ton rôle ne permet pas d'écouter : rien n'est joué sur ton compte".to_owned()
@@ -304,9 +343,11 @@ fn draw_search(f: &mut Frame, app: &mut App, area: Rect) {
     if s.loading {
         f.render_widget(Paragraph::new(Line::from("recherche… ").fg(t.muted)).alignment(Alignment::Right), input);
     }
+    let liked = &app.liked;
     let rows = s.results.iter().map(|track| {
+        let heart = if liked.get(&track.uri) == Some(&true) { "♥ " } else { "" };
         Row::new::<Vec<ratatui::widgets::Cell>>(vec![
-            track.name.clone().fg(t.text).into(),
+            Line::from(vec![Span::raw(heart).fg(t.bad), Span::raw(track.name.clone()).fg(t.text)]).into(),
             track.artist_names().fg(t.muted).into(),
             fmt_ms(track.duration_ms).fg(t.muted).into(),
         ])
@@ -327,15 +368,15 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme;
     let me = app.me().map(|m| m.name.as_str()).unwrap_or("?");
     let role = app.me().map(|m| format!(" ({})", m.role.label().to_lowercase())).unwrap_or_default();
-    let room = match app.current_invite() {
-        Some(link) if app.hosting => format!("{link} (i copier)"),
-        _ => app.settings.code.clone(),
+    // The full invite link is long (peer-to-peer key): only the code here,
+    // `i` copies the link.
+    let room = if app.invite.is_some() {
+        format!("Salon {} · i inviter", app.settings.code)
+    } else {
+        format!("Salon {}", app.settings.code)
     };
-    let left = format!(
-        " {room} │ {} membre{} │ {me}{role} │ / chercher  l bibliothèque  espace pause  s suivant  ? aide  q quitter",
-        app.members.len(),
-        if app.members.len() > 1 { "s" } else { "" },
-    );
+    let members = format!("{} membre{}", app.members.len(), if app.members.len() > 1 { "s" } else { "" });
+    let left = status_line(&room, &members, &format!("{me}{role}"), area.width as usize);
     let bar = Style::new().bg(t.selection).fg(t.text);
     f.render_widget(Paragraph::new(Line::from(left)).style(bar), area);
     if let Some((text, level)) = app.active_toast() {
@@ -344,10 +385,25 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// Status bar text fitting `width`: the key hints are dropped from the least
+/// useful one until the line fits.
+pub fn status_line(room: &str, members: &str, me: &str, width: usize) -> String {
+    const HINTS: [&str; 7] = ["? aide", "q quitter", "/ chercher", "l bibliothèque", "espace pause", "s suivant", "+/- volume"];
+    let base = format!(" {room} │ {members} │ {me}");
+    let mut hints: Vec<&str> = HINTS.to_vec();
+    loop {
+        let line = if hints.is_empty() { base.clone() } else { format!("{base} │ {}", hints.join("  ")) };
+        if line.chars().count() <= width || hints.is_empty() {
+            return line;
+        }
+        hints.pop();
+    }
+}
+
 fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme;
     let w = 64.min(area.width);
-    let h = 26.min(area.height);
+    let h = 29.min(area.height);
     let popup = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
     f.render_widget(Clear, popup);
     let key = |k: &str, what: &str| Line::from(vec![Span::raw(format!("  {k:<14}")).fg(t.accent), Span::raw(what.to_owned()).fg(t.text)]);
@@ -367,6 +423,9 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         key("c", "pochette : ascii / blocs"),
         key("p", "permissions des membres (hôte)"),
         key("l", "ta bibliothèque : titres likés et playlists"),
+        key("+ -", "ton volume (toi seul)"),
+        key("m", "muet pour ce titre (toi seul)"),
+        key("f", "j'aime / je n'aime plus"),
         key("A", "playlist d'autoplay (hôte)"),
         key("i", "copier le lien d'invitation"),
         key("q  Ctrl+C", "quitter le salon"),
@@ -531,6 +590,7 @@ fn draw_picker(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_library(f: &mut Frame, app: &mut App, area: Rect) {
     let t = app.theme;
     let perms = app.my_perms();
+    let liked = app.liked.clone();
     let Some(library) = app.library.as_mut() else { return };
     let w = 100.min(area.width.saturating_sub(4)).max(40.min(area.width));
     let h = (area.height * 4 / 5).max(12.min(area.height));
@@ -597,9 +657,10 @@ fn draw_library(f: &mut Frame, app: &mut App, area: Rect) {
                 f.render_widget(Paragraph::new(Line::from("Chargement des titres…").fg(t.muted)), list);
             } else {
                 let rows = open.tracks.iter().enumerate().map(|(i, track)| {
+                    let heart = if liked.get(&track.uri) == Some(&true) { "♥ " } else { "" };
                     Row::new::<Vec<ratatui::widgets::Cell>>(vec![
                         format!("{:>3}", i + 1).fg(t.muted).into(),
-                        track.name.clone().fg(t.text).into(),
+                        Line::from(vec![Span::raw(heart).fg(t.bad), Span::raw(track.name.clone()).fg(t.text)]).into(),
                         track.artist_names().fg(t.muted).into(),
                         fmt_ms(track.duration_ms).fg(t.muted).into(),
                     ])
@@ -617,8 +678,24 @@ fn draw_library(f: &mut Frame, app: &mut App, area: Rect) {
             first.extend(key("t", "tout ajouter à la file", perms.queue_manage));
             let mut second = key("p", "jouer la liste", perms.queue_manage && perms.playback);
             second.extend(key("s", "jouer en aléatoire", perms.queue_manage && perms.playback));
+            second.extend(key("f", "j'aime", true));
             second.extend(key("Échap", "retour", true));
             f.render_widget(Paragraph::new(vec![Line::from(first), Line::from(second)]), help);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::status_line;
+
+    #[test]
+    fn status_line_keeps_the_essentials_on_narrow_terminals() {
+        let wide = status_line("Salon KD8YZS · i inviter", "1 membre", "Alenzo.amico (hôte)", 200);
+        assert!(wide.contains("KD8YZS") && wide.contains("+/- volume") && wide.contains("? aide"));
+        let narrow = status_line("Salon KD8YZS · i inviter", "1 membre", "Alenzo.amico (hôte)", 90);
+        assert!(narrow.chars().count() <= 90, "{narrow}");
+        assert!(narrow.contains("KD8YZS") && narrow.contains("Alenzo.amico") && narrow.contains("? aide"));
+        assert!(!narrow.contains("+/- volume"));
     }
 }

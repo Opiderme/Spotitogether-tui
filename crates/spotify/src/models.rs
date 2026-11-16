@@ -23,6 +23,12 @@ pub struct Device {
     pub is_restricted: bool,
     #[serde(default)]
     pub volume_percent: Option<u8>,
+    #[serde(default = "yes")]
+    pub supports_volume: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -157,6 +163,7 @@ mod tests {
             is_active: false,
             is_restricted: restricted,
             volume_percent: None,
+            supports_volume: true,
         }
     }
 

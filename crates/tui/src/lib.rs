@@ -32,6 +32,10 @@ enum Loaded {
     PlaylistTracks { name: String, result: Result<Vec<spotify::models::Track>, String> },
     Library(Result<Vec<spotify::models::PlaylistSummary>, String>),
     LibraryList { key: String, result: Result<Vec<spotify::models::Track>, String> },
+    Volume(Option<u8>),
+    Liked(Vec<(String, bool)>),
+    LikeDone { uri: String, name: String, liked: bool, result: Result<(), String> },
+    Failed(String),
 }
 
 /// How the room screen was opened.
@@ -128,6 +132,46 @@ async fn event_loop(
                         });
                     }
                 }
+                Effect::SetVolume(percent) => {
+                    if let Some(sp) = spotify.clone() {
+                        let tx = loaded_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = sp.set_volume(None, percent).await {
+                                let _ = tx.send(Loaded::Failed(format!("Volume : {e}")));
+                            }
+                        });
+                    }
+                }
+                Effect::LoadVolume => {
+                    if let Some(sp) = spotify.clone() {
+                        let tx = loaded_tx.clone();
+                        tokio::spawn(async move {
+                            if let Ok(v) = sp.volume().await {
+                                let _ = tx.send(Loaded::Volume(v));
+                            }
+                        });
+                    }
+                }
+                Effect::CheckLiked(uris) => {
+                    if let Some(sp) = spotify.clone() {
+                        let tx = loaded_tx.clone();
+                        tokio::spawn(async move {
+                            // Missing scope (old login) or other error: just no ♥.
+                            if let Ok(flags) = sp.library_contains(&uris).await {
+                                let _ = tx.send(Loaded::Liked(uris.into_iter().zip(flags).collect()));
+                            }
+                        });
+                    }
+                }
+                Effect::SetLiked { uri, name, liked } => {
+                    if let Some(sp) = spotify.clone() {
+                        let tx = loaded_tx.clone();
+                        tokio::spawn(async move {
+                            let result = sp.set_liked(std::slice::from_ref(&uri), liked).await.map_err(|e| e.to_string());
+                            let _ = tx.send(Loaded::LikeDone { uri, name, liked, result });
+                        });
+                    }
+                }
                 Effect::LoadLibrary => {
                     if let Some(sp) = spotify.clone() {
                         let tx = loaded_tx.clone();
@@ -189,17 +233,22 @@ async fn event_loop(
                     vec![Effect::Quit]
                 }
             },
-            Some(outcome) = search_rx.recv() => { app.on_search(outcome); vec![] }
+            Some(outcome) = search_rx.recv() => app.on_search(outcome),
             Some((url, img)) = cover_rx.recv() => { app.on_cover(url, img); vec![] }
             Some(()) = theme_rx.recv() => { app.theme = Theme::load(); vec![] }
             Some(loaded) = loaded_rx.recv() => match loaded {
                 Loaded::Playlists(result) => { app.on_playlists(result); vec![] }
                 Loaded::PlaylistTracks { name, result } => app.on_playlist_tracks(name, result),
                 Loaded::Library(result) => { app.on_library(result); vec![] }
+                Loaded::Volume(v) => { app.on_volume(v); vec![] }
+                Loaded::Liked(states) => { app.on_liked(states); vec![] }
+                Loaded::LikeDone { uri, name, liked, result } => { app.on_like_done(uri, name, liked, result); vec![] }
+                Loaded::Failed(text) => { app.toast(text, app::Level::Bad); vec![] }
                 Loaded::LibraryList { key, result } => { app.on_library_list(key, result); vec![] }
             },
             Some(cmd) = mpris_cmd_rx.recv() => app.on_mpris(cmd),
             _ = sleep_until_opt(app.search_due()) => app.on_search_due(),
+            _ = sleep_until_opt(app.volume_due()) => app.on_volume_due(),
             _ = frame.tick() => {
                 frames += 1;
                 // Position refresh for MPRIS clients, once per second.
