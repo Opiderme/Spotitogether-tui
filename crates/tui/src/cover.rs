@@ -92,7 +92,7 @@ pub fn render(img: &DynamicImage, width: u16, height: u16, mode: CoverMode) -> V
 
 /// Character for a pixel: brighter pixels get denser characters, so the
 /// coloured glyphs carry the image on a dark terminal.
-fn ramp_char(p: Rgba<u8>) -> char {
+pub(crate) fn ramp_char(p: Rgba<u8>) -> char {
     let luma = 0.2126 * f32::from(p[0]) + 0.7152 * f32::from(p[1]) + 0.0722 * f32::from(p[2]);
     let index = ((luma / 255.0) * (RAMP.len() - 1) as f32).round() as usize;
     // Keep a visible dot even for near-black pixels.

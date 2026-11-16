@@ -140,6 +140,9 @@ pub struct TrackInfo {
     /// `SpotifyClient::play_track`).
     #[serde(default)]
     pub album_uri: Option<String>,
+    /// Album name (helps finding the lyrics).
+    #[serde(default)]
+    pub album_name: Option<String>,
     #[serde(default)]
     pub cover_url: Option<String>,
 }
@@ -351,7 +354,7 @@ mod tests {
                 name: "X".into(),
                 artists: "Y".into(),
                 duration_ms,
-                album_uri: None,
+                album_uri: None, album_name: None,
                 cover_url: None,
             },
             added_by: "a".into(),

@@ -23,7 +23,7 @@ async fn joins_and_receives_playback() {
     let mut joined = join(opts(&url, "abc234"), None).await.unwrap();
     assert_eq!(joined.room.settings.code, "ABC234");
 
-    let track = TrackInfo { uri: "spotify:track:1".into(), name: "T".into(), artists: "A".into(), duration_ms: 60_000, album_uri: None, cover_url: None };
+    let track = TrackInfo { uri: "spotify:track:1".into(), name: "T".into(), artists: "A".into(), duration_ms: 60_000, album_uri: None, album_name: None, cover_url: None };
     assert!(joined.handle.send(ClientMsg::QueueAdd { track }));
 
     let playback = tokio::time::timeout(Duration::from_secs(3), async {
@@ -182,7 +182,7 @@ async fn joins_over_the_peer_to_peer_tunnel() {
     assert_eq!(joined.room.settings.code, "ABC234");
 
     // Commands flow both ways through the tunnel.
-    let track = TrackInfo { uri: "spotify:track:1".into(), name: "T".into(), artists: "A".into(), duration_ms: 60_000, album_uri: None, cover_url: None };
+    let track = TrackInfo { uri: "spotify:track:1".into(), name: "T".into(), artists: "A".into(), duration_ms: 60_000, album_uri: None, album_name: None, cover_url: None };
     let host_client = join(opts(&guest.ws_url(), "ABC234"), None).await.unwrap();
     host_client.handle.send(ClientMsg::QueueAdd { track });
     tokio::time::timeout(Duration::from_secs(10), async {

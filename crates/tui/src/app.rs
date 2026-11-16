@@ -30,6 +30,8 @@ pub enum Effect {
     Search { request: u64, query: String, offset: u32 },
     FetchCover(String),
     LoadPlaylists,
+    /// Look the lyrics of a track up (LRCLIB).
+    FetchLyrics(crate::lyrics::Query),
     /// This member's own volume (only they hear it).
     SetVolume(u8),
     /// Read the current volume of the member's player.
@@ -168,6 +170,15 @@ pub struct App {
     pub perm_panel: Option<PermPanel>,
     pub playlist_picker: Option<PlaylistPicker>,
     pub library: Option<crate::library::Library>,
+    /// Full-screen visualizer (`v`).
+    pub visualizer: Option<crate::visualizer::Visualizer>,
+    /// Full-screen lyrics (`y`).
+    pub lyrics: Option<crate::lyrics::LyricsScreen>,
+    /// Last lyrics animation style, kept between openings.
+    pub lyrics_style: usize,
+    /// Last visualizer style and cover look, kept between openings.
+    pub visual_style: usize,
+    pub visual_look: crate::visualizer::CoverLook,
     /// This member's volume (None until read from Spotify).
     pub volume: Option<u8>,
     /// Muted for the current track only: (item id, volume to restore).
@@ -217,6 +228,11 @@ impl App {
             perm_panel: None,
             playlist_picker: None,
             library: None,
+            visualizer: None,
+            lyrics: None,
+            lyrics_style: 0,
+            visual_style: 0,
+            visual_look: crate::visualizer::CoverLook::Blocks,
             volume: None,
             muted: None,
             volume_due: None,
@@ -442,10 +458,10 @@ impl App {
 
     /// New track: lift a per-track mute, refresh the liked state.
     fn on_track_changed(&mut self, item: Option<protocol::ItemId>) -> Vec<Effect> {
+        let mut fx = self.fetch_lyrics();
         if !self.can_play {
-            return vec![];
+            return fx;
         }
-        let mut fx = Vec::new();
         if let Some((muted_item, restore)) = self.muted
             && Some(muted_item) != item
         {
@@ -613,6 +629,12 @@ impl App {
             self.show_help = false;
             return vec![];
         }
+        if self.visualizer.is_some() {
+            return self.on_visualizer_key(key);
+        }
+        if self.lyrics.is_some() {
+            return self.on_lyrics_key(key);
+        }
         if self.perm_panel.is_some() {
             return self.on_perm_key(key);
         }
@@ -649,6 +671,8 @@ impl App {
             KeyCode::Char(' ') => return self.toggle_play(),
             KeyCode::Char('s') => return self.skip_or_vote(),
             KeyCode::Char('l') => return self.open_library(),
+            KeyCode::Char('v') => self.open_visualizer(),
+            KeyCode::Char('y') => return self.open_lyrics(),
             KeyCode::Char('+') | KeyCode::Char('=') => return self.change_volume(i16::from(VOLUME_STEP)),
             KeyCode::Char('-') => return self.change_volume(-i16::from(VOLUME_STEP)),
             KeyCode::Char('m') => return self.toggle_mute(),
@@ -765,6 +789,18 @@ impl App {
             if matches!(m.kind, MouseEventKind::Down(_)) {
                 self.show_help = false;
             }
+            return vec![];
+        }
+        if self.lyrics.is_some() {
+            return vec![];
+        }
+        if let Some(v) = self.visualizer.as_mut() {
+            match m.kind {
+                MouseEventKind::Down(MouseButton::Left) | MouseEventKind::ScrollDown => v.next_style(1),
+                MouseEventKind::ScrollUp => v.next_style(-1),
+                _ => {}
+            }
+            self.visual_style = v.style;
             return vec![];
         }
         if self.perm_panel.is_some() {
@@ -1011,6 +1047,122 @@ impl App {
             Command::Seek(offset_ms) => self.seek_relative(offset_ms),
             Command::SetPosition(ms) => self.seek_to(ms),
         }
+    }
+
+    // --------------------------------------------------------- visualizer
+
+    fn open_visualizer(&mut self) {
+        let mut v = crate::visualizer::Visualizer::new(self.visual_style);
+        v.look = self.visual_look;
+        self.visualizer = Some(v);
+    }
+
+    // ------------------------------------------------------------- lyrics
+
+    fn open_lyrics(&mut self) -> Vec<Effect> {
+        self.lyrics = Some(crate::lyrics::LyricsScreen::with_style(self.lyrics_style));
+        self.fetch_lyrics()
+    }
+
+    /// Lyrics of the current track, if the lyrics screen is open.
+    fn fetch_lyrics(&mut self) -> Vec<Effect> {
+        let Some(screen) = self.lyrics.as_mut() else { return vec![] };
+        let Some(item) = self.playback.current.as_ref() else {
+            screen.reset(None);
+            return vec![];
+        };
+        let t = &item.track;
+        screen.reset(Some(t.uri.clone()));
+        let artist = t.artists.split(", ").next().unwrap_or(&t.artists).to_owned();
+        vec![Effect::FetchLyrics(crate::lyrics::Query {
+            key: t.uri.clone(),
+            title: t.name.clone(),
+            artist,
+            album: t.album_name.clone(),
+            duration_ms: t.duration_ms,
+        })]
+    }
+
+    pub fn on_lyrics(&mut self, key: String, result: Result<crate::lyrics::Lyrics, String>) {
+        if let Some(screen) = self.lyrics.as_mut() {
+            screen.set_result(&key, result);
+        }
+    }
+
+    fn on_lyrics_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        if let Some(screen) = self.lyrics.as_mut() {
+            let changed = match key.code {
+                KeyCode::Right | KeyCode::Tab | KeyCode::Char('n') => Some(1),
+                KeyCode::Left | KeyCode::BackTab | KeyCode::Char('N') => Some(-1),
+                _ => None,
+            };
+            if let Some(d) = changed {
+                screen.next_style(d);
+                self.lyrics_style = screen.style;
+                return vec![];
+            }
+            if let KeyCode::Char(d @ '1'..='8') = key.code {
+                screen.set_style(d as usize - '1' as usize);
+                self.lyrics_style = screen.style;
+                return vec![];
+            }
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('y') | KeyCode::Char('q') => self.lyrics = None,
+            KeyCode::Char('v') => {
+                self.lyrics = None;
+                self.open_visualizer();
+            }
+            KeyCode::Char(' ') => return self.toggle_play(),
+            KeyCode::Char('s') => return self.skip_or_vote(),
+            KeyCode::Char('+') | KeyCode::Char('=') => return self.change_volume(i16::from(VOLUME_STEP)),
+            KeyCode::Char('-') => return self.change_volume(-i16::from(VOLUME_STEP)),
+            KeyCode::Char('m') => return self.toggle_mute(),
+            KeyCode::Char('f') => return self.like_current(),
+            _ => {}
+        }
+        vec![]
+    }
+
+    fn on_visualizer_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        let Some(v) = self.visualizer.as_mut() else { return vec![] };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('v') | KeyCode::Char('q') => {
+                self.visual_style = v.style;
+                self.visualizer = None;
+            }
+            KeyCode::Right | KeyCode::Tab | KeyCode::Char('n') => v.next_style(1),
+            KeyCode::Left | KeyCode::BackTab | KeyCode::Char('N') => v.next_style(-1),
+            KeyCode::Char(d @ '0'..='9') => v.set_style((d as usize - '0' as usize + 9) % 10),
+            KeyCode::Char('c') => {
+                use crate::visualizer::CoverLook;
+                v.look = v.look.next(self.image_picker.is_some());
+                self.visual_look = v.look;
+                let text = if v.look == CoverLook::Image && crate::visualizer::animates_cover(v.style) {
+                    "Pochette : image (ce style anime la pochette : affichée en blocs)".to_owned()
+                } else {
+                    format!("Pochette : {}", v.look.label())
+                };
+                self.toast(text, Level::Info);
+                return vec![];
+            }
+            KeyCode::Char('y') => {
+                self.visual_style = v.style;
+                self.visualizer = None;
+                return self.open_lyrics();
+            }
+            KeyCode::Char(' ') => return self.toggle_play(),
+            KeyCode::Char('s') => return self.skip_or_vote(),
+            KeyCode::Char('+') | KeyCode::Char('=') => return self.change_volume(i16::from(VOLUME_STEP)),
+            KeyCode::Char('-') => return self.change_volume(-i16::from(VOLUME_STEP)),
+            KeyCode::Char('m') => return self.toggle_mute(),
+            KeyCode::Char('f') => return self.like_current(),
+            _ => {}
+        }
+        if let Some(v) = &self.visualizer {
+            self.visual_style = v.style;
+        }
+        vec![]
     }
 
     // ------------------------------------------------------------ library
@@ -1537,7 +1689,7 @@ mod tests {
                 name: format!("T{id}"),
                 artists: "A".into(),
                 duration_ms: 100_000,
-                album_uri: None,
+                album_uri: None, album_name: None,
                 cover_url: Some(format!("https://i.scdn.co/image/{id}")),
             },
             added_by: "Alex".into(),

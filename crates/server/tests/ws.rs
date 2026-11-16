@@ -52,7 +52,7 @@ async fn join(url: &str, code: &str, name: &str, host: bool) -> Ws {
 }
 
 fn track(ms: u64) -> TrackInfo {
-    TrackInfo { uri: "spotify:track:1".into(), name: "One More Time".into(), artists: "Daft Punk".into(), duration_ms: ms, album_uri: None, cover_url: None }
+    TrackInfo { uri: "spotify:track:1".into(), name: "One More Time".into(), artists: "Daft Punk".into(), duration_ms: ms, album_uri: None, album_name: None, cover_url: None }
 }
 
 #[tokio::test]

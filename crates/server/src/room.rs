@@ -666,7 +666,7 @@ mod tests {
             name: format!("T{n}"),
             artists: "A".into(),
             duration_ms,
-            album_uri: None,
+            album_uri: None, album_name: None,
             cover_url: None,
         }
     }

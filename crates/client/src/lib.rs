@@ -170,6 +170,7 @@ pub fn track_info(t: &spotify::models::Track) -> protocol::TrackInfo {
         artists: t.artist_names(),
         duration_ms: t.duration_ms,
         album_uri: Some(t.album.uri.clone()).filter(|u| !u.is_empty()),
+        album_name: Some(t.album.name.clone()).filter(|n| !n.is_empty()),
         cover_url: t.cover_url().map(str::to_owned),
     }
 }

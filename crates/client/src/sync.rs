@@ -193,7 +193,7 @@ mod tests {
             name: "Aerodynamic".into(),
             artists: "Daft Punk".into(),
             duration_ms: 1,
-            album_uri: None,
+            album_uri: None, album_name: None,
             cover_url: None,
         }
     }

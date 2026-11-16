@@ -4,11 +4,13 @@
 #   docker logs salon        # code d'invitation et jeton d'hôte
 
 FROM rust:1-slim AS build
+RUN apt-get update && apt-get install -y --no-install-recommends libpulse-dev pkg-config && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
 RUN cargo build --release --locked -p spotitogether
 
 FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends libpulse0 && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --uid 10001 spotitogether \
     && mkdir /data && chown spotitogether /data
 COPY --from=build /src/target/release/spotitogether /usr/local/bin/spotitogether

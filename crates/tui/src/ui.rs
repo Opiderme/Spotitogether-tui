@@ -18,6 +18,12 @@ const LIKED: &str = "[ ♥ ]";
 const NOT_LIKED: &str = "[ ♡ ]";
 
 pub fn draw(f: &mut Frame, app: &mut App) {
+    if app.visualizer.is_some() {
+        return draw_visualizer(f, app);
+    }
+    if app.lyrics.is_some() {
+        return draw_lyrics(f, app);
+    }
     let area = f.area();
     let now_height = if area.height >= 34 { 14 } else { 10 };
     let [now, middle, search, status] = Layout::vertical([
@@ -194,6 +200,113 @@ fn draw_now_playing(f: &mut Frame, app: &mut App, area: Rect) {
         "Mode spectateur : rien n'est joué sur ton compte".into()
     };
     f.render_widget(Paragraph::new(Line::from(footer).fg(t.muted)), line(10));
+}
+
+/// Full screen lyrics: lines appear at their time all over the screen.
+fn draw_lyrics(f: &mut Frame, app: &mut App) {
+    use crate::lyrics::{Lyrics, Status};
+    let t = app.theme;
+    let area = f.area();
+    let position = app.position_ms();
+    let Some(screen) = app.lyrics.as_mut() else { return };
+    // Colours of the cover, recomputed only when the cover changes.
+    let cover_key = app.cover.as_ref().map(|(url, _)| url.clone());
+    if screen.palette.is_empty() || screen.palette_key != cover_key {
+        let from_cover = app.cover.as_ref().map(|(_, img)| {
+            crate::visualizer::palette(&img.resize_exact(64, 64, image::imageops::FilterType::Triangle).to_rgba8())
+        });
+        screen.palette = from_cover.filter(|p| p.len() >= 2).unwrap_or_else(|| vec![t.accent, t.accent2, t.warn, t.good]);
+        screen.palette_key = cover_key;
+    }
+    let stage = Rect { height: area.height.saturating_sub(2), ..area };
+    screen.update(position, stage);
+    screen.draw(f.buffer_mut(), position);
+
+    // Centered message when there is nothing to show.
+    let message = match &screen.status {
+        _ if app.playback.current.is_none() => Some("Rien en lecture".to_owned()),
+        Status::Loading => Some("Recherche des paroles…".to_owned()),
+        Status::Failed(e) => Some(format!("Paroles indisponibles : {e}")),
+        Status::Ready(Lyrics::NotFound) => Some("Pas de paroles trouvées pour ce titre".to_owned()),
+        Status::Ready(Lyrics::Instrumental) => Some("♪  Instrumental  ♪".to_owned()),
+        Status::Ready(Lyrics::Timed { lines, .. }) if lines.first().is_some_and(|l| position + 150 < l.at_ms) => {
+            Some("♪".to_owned())
+        }
+        Status::Ready(Lyrics::Timed { .. }) => None,
+    };
+    if let Some(text) = message {
+        let y = stage.y + stage.height / 2;
+        f.render_widget(Paragraph::new(Line::from(text).fg(t.muted)).alignment(Alignment::Center), Rect { y, height: 1, ..stage });
+    }
+
+    // Bottom: progress and info.
+    let bar = Rect { y: area.bottom().saturating_sub(2), height: 1, ..area };
+    let info = Rect { y: area.bottom().saturating_sub(1), height: 1, ..area };
+    if let Some(item) = &app.playback.current {
+        let frac = if item.track.duration_ms == 0 { 0.0 } else { position as f64 / item.track.duration_ms as f64 };
+        let done = (frac.clamp(0.0, 1.0) * f64::from(bar.width)) as usize;
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw("━".repeat(done)).fg(screen.palette.first().copied().unwrap_or(t.accent)),
+                Span::raw("─".repeat(usize::from(bar.width).saturating_sub(done))).fg(t.border),
+            ])),
+            bar,
+        );
+        let note = match &screen.status {
+            Status::Ready(Lyrics::Timed { approximate: true, .. }) => "  (paroles non synchronisées, approximatives)",
+            _ => "",
+        };
+        let left = format!(
+            " {} {} — {}   {} / {}{note}",
+            if app.playback.is_playing { "▶" } else { "⏸" },
+            item.track.name,
+            item.track.artists,
+            fmt_ms(position),
+            fmt_ms(item.track.duration_ms)
+        );
+        f.render_widget(Paragraph::new(Line::from(left).fg(t.text)), info);
+    }
+    let keys = format!(
+        " {}/8 {}   ←→ style   v visualiseur   Échap retour   paroles : LRCLIB ",
+        screen.style + 1,
+        screen.style_name()
+    );
+    f.render_widget(Paragraph::new(Line::from(keys).fg(t.muted)).alignment(Alignment::Right), info);
+    if let Some((name, k)) = screen.banner() {
+        let level = (255.0 * k) as u8;
+        let banner = Line::from(format!("  ◆ {name} ◆  ")).fg(ratatui::style::Color::Rgb(level, level, level)).bold();
+        f.render_widget(Paragraph::new(banner).alignment(Alignment::Center), Rect { y: area.y + 1, height: 1, ..area });
+    }
+    if let Some((text, level)) = app.active_toast() {
+        let line = Line::from(format!(" {text} ")).fg(level_color(app, level)).bold();
+        f.render_widget(Paragraph::new(line).alignment(Alignment::Center), Rect { y: area.y, height: 1, ..area });
+    }
+}
+
+/// Full screen: cover, animation and a discreet info line.
+fn draw_visualizer(f: &mut Frame, app: &mut App) {
+    let Some(mut v) = app.visualizer.take() else { return };
+    let t = app.theme;
+    let fallback = [t.accent, t.accent2, t.warn, t.good, t.bad];
+    let cover = app.cover.as_ref().map(|(url, img)| (url.as_str(), img));
+    v.set_cover(cover.map(|c| c.0), cover.map(|c| c.1), &fallback);
+    v.ink = t.text;
+    let position_ms = app.position_ms();
+    let track = app.playback.current.as_ref().map(|i| crate::visualizer::Track {
+        title: &i.track.name,
+        artists: &i.track.artists,
+        position_ms,
+        duration_ms: i.track.duration_ms,
+        playing: app.playback.is_playing,
+    });
+    let dt = v.dt;
+    v.draw(f, track.as_ref(), dt, app.cover_image.as_mut());
+    if let Some((text, level)) = app.active_toast() {
+        let area = f.area();
+        let line = Line::from(format!(" {text} ")).fg(level_color(app, level)).bold();
+        f.render_widget(Paragraph::new(line).alignment(Alignment::Center), Rect { y: area.y, height: 1, ..area });
+    }
+    app.visualizer = Some(v);
 }
 
 fn draw_cover(f: &mut Frame, app: &mut App, area: Rect) {
@@ -388,7 +501,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
 /// Status bar text fitting `width`: the key hints are dropped from the least
 /// useful one until the line fits.
 pub fn status_line(room: &str, members: &str, me: &str, width: usize) -> String {
-    const HINTS: [&str; 7] = ["? aide", "q quitter", "/ chercher", "l bibliothèque", "espace pause", "s suivant", "+/- volume"];
+    const HINTS: [&str; 9] = ["? aide", "q quitter", "/ chercher", "l bibliothèque", "v visualiseur", "y paroles", "espace pause", "s suivant", "+/- volume"];
     let base = format!(" {room} │ {members} │ {me}");
     let mut hints: Vec<&str> = HINTS.to_vec();
     loop {
@@ -403,7 +516,7 @@ pub fn status_line(room: &str, members: &str, me: &str, width: usize) -> String 
 fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme;
     let w = 64.min(area.width);
-    let h = 29.min(area.height);
+    let h = 31.min(area.height);
     let popup = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
     f.render_widget(Clear, popup);
     let key = |k: &str, what: &str| Line::from(vec![Span::raw(format!("  {k:<14}")).fg(t.accent), Span::raw(what.to_owned()).fg(t.text)]);
@@ -423,6 +536,8 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         key("c", "pochette : ascii / blocs"),
         key("p", "permissions des membres (hôte)"),
         key("l", "ta bibliothèque : titres likés et playlists"),
+        key("v", "visualiseur plein écran (10 styles)"),
+        key("y", "paroles synchronisées plein écran"),
         key("+ -", "ton volume (toi seul)"),
         key("m", "muet pour ce titre (toi seul)"),
         key("f", "j'aime / je n'aime plus"),

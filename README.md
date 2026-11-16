@@ -58,6 +58,8 @@ Dans un salon, l'interface plein écran se pilote au clavier et à la souris :
 | `l` | ta bibliothèque (titres likés, playlists) : filtrer (`/`, par titre, artiste ou album), ajouter un titre (Entrée), toute la liste ou les titres filtrés (`t`), les jouer tout de suite dans l'ordre (`p`) ou en aléatoire (`s`) |
 | espace, `s`, ← → | lecture/pause du salon, morceau suivant, ±10 s |
 | `j` `k`, `J` `K`, `d` | sélection, déplacement et retrait dans la file |
+| `v` | visualiseur plein écran : la pochette et une animation qui réagit au son, 10 styles (`←` `→` ou `1`–`0` ; `c` pochette en blocs, ASCII couleur, ASCII pur ou vraie image ; `Échap` retour) |
+| `y` | paroles synchronisées plein écran, 8 styles d'apparition (`←` `→` ou `1`–`8` : dispersé, karaoké, chute, décodage, vague, explosion, néon, bulles ; `v` bascule vers le visualiseur) |
 | `+` `-`, `m` | ton volume, muet pour le titre en cours (toi seul ; le son revient au suivant) |
 | `f` | j'aime / je n'aime plus (titre en cours, ou sélectionné dans la recherche et la bibliothèque) |
 | `r` | resynchroniser ton Spotify |
@@ -71,6 +73,15 @@ Dans un salon, l'interface plein écran se pilote au clavier et à la souris :
 ligne de la file pour la déplacer, molette pour défiler. Les couleurs suivent le
 thème Caelestia s'il est présent (rechargé quand le fond d'écran change).
 `join --plain` garde l'ancien client en lignes de commande.
+
+Le visualiseur écoute la sortie son de ton PC (la « source moniteur » de
+PipeWire/PulseAudio, comme `cava`) pour réagir à la musique ; rien n'est
+enregistré ni envoyé, et la capture s'arrête quand tu le fermes. Sans serveur son,
+l'animation est simulée.
+
+Les paroles viennent de [LRCLIB](https://lrclib.net), base libre et gratuite :
+seuls le titre, l'artiste, l'album et la durée du morceau lui sont envoyés, et
+les paroles sont gardées en cache dans `~/.cache/spotitogether/lyrics/`.
 
 Le morceau du salon apparaît aussi comme lecteur MPRIS « Spotitogether » : barre
 Caelestia, `playerctl` et touches multimédia (avec les droits de ton rôle). Si la

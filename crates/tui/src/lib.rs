@@ -2,12 +2,15 @@
 //! and mouse, themed with Caelestia's colours when available.
 
 mod app;
+mod audio;
 mod cover;
 mod library;
+mod lyrics;
 pub mod launcher;
 mod mpris;
 mod theme;
 mod ui;
+mod visualizer;
 
 use std::io::stdout;
 use std::sync::Arc;
@@ -36,6 +39,7 @@ enum Loaded {
     Liked(Vec<(String, bool)>),
     LikeDone { uri: String, name: String, liked: bool, result: Result<(), String> },
     Failed(String),
+    Lyrics { key: String, result: Result<lyrics::Lyrics, String> },
 }
 
 /// How the room screen was opened.
@@ -89,6 +93,12 @@ async fn event_loop(
     let mpris = mpris::spawn(mpris_cmd_tx);
     let mut mpris_shown = mpris::Shown::default();
     let mut frames = 0u64;
+    // Visualizer: 30 frames per second and the system sound, only while open.
+    let vis_started = std::time::Instant::now();
+    let mut vis_tick = tokio::time::interval(Duration::from_millis(33));
+    vis_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut audio: Option<audio::AudioCapture> = None;
+    let mut audio_failed = false;
     // Kept alive for the whole session.
     let _theme_watcher = watch_theme(theme_tx);
 
@@ -122,6 +132,17 @@ async fn event_loop(
                 Effect::CopyInvite(link) => {
                     let how = copy_to_clipboard(&link);
                     app.toast(format!("Lien copié ({how}) : {link}"), app::Level::Good);
+                }
+                Effect::FetchLyrics(query) => {
+                    let (http, tx) = (http.clone(), loaded_tx.clone());
+                    tokio::spawn(async move {
+                        let duration = query.duration_ms;
+                        let result = lyrics::fetch(&http, &query)
+                            .await
+                            .map(|record| lyrics::Lyrics::from_record(record, duration))
+                            .map_err(|e| e.to_string());
+                        let _ = tx.send(Loaded::Lyrics { key: query.key, result });
+                    });
                 }
                 Effect::LoadPlaylists => {
                     if let Some(sp) = spotify.clone() {
@@ -217,6 +238,11 @@ async fn event_loop(
             }
         }
 
+        // Closing the visualizer stops the sound capture.
+        if app.visualizer.is_none() && (audio.is_some() || audio_failed) {
+            audio = None;
+            audio_failed = false;
+        }
         terminal.draw(|f| ui::draw(f, &mut app))?;
         if let Some(tx) = &mpris {
             for update in mpris::diff(&mut mpris_shown, &app) {
@@ -235,7 +261,13 @@ async fn event_loop(
             },
             Some(outcome) = search_rx.recv() => app.on_search(outcome),
             Some((url, img)) = cover_rx.recv() => { app.on_cover(url, img); vec![] }
-            Some(()) = theme_rx.recv() => { app.theme = Theme::load(); vec![] }
+            Some(()) = theme_rx.recv() => {
+                let theme = Theme::load();
+                if theme != app.theme {
+                    app.theme = theme;
+                }
+                vec![]
+            }
             Some(loaded) = loaded_rx.recv() => match loaded {
                 Loaded::Playlists(result) => { app.on_playlists(result); vec![] }
                 Loaded::PlaylistTracks { name, result } => app.on_playlist_tracks(name, result),
@@ -244,9 +276,34 @@ async fn event_loop(
                 Loaded::Liked(states) => { app.on_liked(states); vec![] }
                 Loaded::LikeDone { uri, name, liked, result } => { app.on_like_done(uri, name, liked, result); vec![] }
                 Loaded::Failed(text) => { app.toast(text, app::Level::Bad); vec![] }
+                Loaded::Lyrics { key, result } => { app.on_lyrics(key, result); vec![] }
                 Loaded::LibraryList { key, result } => { app.on_library_list(key, result); vec![] }
             },
             Some(cmd) = mpris_cmd_rx.recv() => app.on_mpris(cmd),
+            // 30 fps for the visualizer, and smooth typing on the lyrics screen.
+            _ = vis_tick.tick(), if app.visualizer.is_some() || app.lyrics.is_some() => {
+                if app.visualizer.is_some() {
+                    if audio.is_none() && !audio_failed {
+                        match audio::AudioCapture::start() {
+                            Ok(capture) => audio = Some(capture),
+                            Err(e) => {
+                                tracing::info!(%e, "system sound unavailable, simulated visualizer");
+                                audio_failed = true;
+                            }
+                        }
+                    }
+                    let live = audio.as_ref().and_then(|a| a.latest());
+                    let simulated = live.is_none();
+                    let analysis = live.unwrap_or_else(|| {
+                        audio::Analysis::simulated(frames as f32 * 0.25 + vis_started.elapsed().as_secs_f32(), app.playback.is_playing)
+                    });
+                    if let Some(v) = app.visualizer.as_mut() {
+                        v.simulated = simulated;
+                        v.update(&analysis);
+                    }
+                }
+                vec![]
+            }
             _ = sleep_until_opt(app.search_due()) => app.on_search_due(),
             _ = sleep_until_opt(app.volume_due()) => app.on_volume_due(),
             _ = frame.tick() => {
@@ -291,6 +348,19 @@ fn copy_to_clipboard(text: &str) -> &'static str {
     "terminal"
 }
 
+/// A real change of Caelestia's scheme. Reading the file (which we do on
+/// every reload) produces "access" events: reacting to those made the
+/// reload trigger itself in a loop and burn a CPU core.
+fn is_scheme_change(event: &notify::Event) -> bool {
+    use notify::EventKind;
+    use notify::event::ModifyKind;
+    let written = matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Name(_) | ModifyKind::Any)
+    );
+    written && event.paths.iter().any(|p| p.ends_with("scheme.json"))
+}
+
 /// Reloads colours when Caelestia rewrites its scheme (wallpaper change).
 fn watch_theme(tx: mpsc::UnboundedSender<()>) -> Option<notify::RecommendedWatcher> {
     use notify::Watcher;
@@ -298,7 +368,7 @@ fn watch_theme(tx: mpsc::UnboundedSender<()>) -> Option<notify::RecommendedWatch
     let dir = path.parent()?.to_owned();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res
-            && event.paths.iter().any(|p| p.ends_with("scheme.json"))
+            && is_scheme_change(&event)
         {
             let _ = tx.send(());
         }
@@ -306,4 +376,25 @@ fn watch_theme(tx: mpsc::UnboundedSender<()>) -> Option<notify::RecommendedWatch
     .ok()?;
     watcher.watch(&dir, notify::RecursiveMode::NonRecursive).ok()?;
     Some(watcher)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_scheme_change;
+    use notify::event::{AccessKind, AccessMode, CreateKind, DataChange, Event, EventKind, MetadataKind, ModifyKind};
+
+    fn event(kind: EventKind, file: &str) -> Event {
+        Event::new(kind).add_path(format!("/home/u/.local/state/caelestia/{file}").into())
+    }
+
+    #[test]
+    fn only_writes_to_the_scheme_reload_the_theme() {
+        assert!(is_scheme_change(&event(EventKind::Modify(ModifyKind::Data(DataChange::Content)), "scheme.json")));
+        assert!(is_scheme_change(&event(EventKind::Create(CreateKind::File), "scheme.json")));
+        // Our own reads must not trigger a reload (that was a busy loop).
+        assert!(!is_scheme_change(&event(EventKind::Access(AccessKind::Open(AccessMode::Read)), "scheme.json")));
+        assert!(!is_scheme_change(&event(EventKind::Access(AccessKind::Close(AccessMode::Read)), "scheme.json")));
+        assert!(!is_scheme_change(&event(EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)), "scheme.json")));
+        assert!(!is_scheme_change(&event(EventKind::Modify(ModifyKind::Data(DataChange::Content)), "notifs.json")));
+    }
 }

@@ -9,7 +9,7 @@ pkgdesc="Écoute Spotify synchronisée entre amis, dans le terminal (TUI, binair
 arch=('x86_64')
 url="https://github.com/Opiderme/Spotitogether-tui"
 license=('MIT')
-depends=('gcc-libs' 'glibc')
+depends=('gcc-libs' 'glibc' 'libpulse')
 optdepends=('caelestia-shell: couleurs du thème Caelestia'
             'spotifyd: lecteur Spotify sans interface graphique')
 provides=("$_pkgname")
