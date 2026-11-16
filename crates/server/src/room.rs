@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::IpAddr;
 
 use protocol::{
-    AUTOPLAY_NAME, AdminCmd, ClientMsg, ErrorCode, ItemId, MAX_AUTOPLAY_TRACKS, Member, MemberId, Overrides, Perm,
+    AUTOPLAY_NAME, AddMode, AdminCmd, ClientMsg, ErrorCode, ItemId, MAX_AUTOPLAY_TRACKS, Member, MemberId, Overrides, Perm,
     Permissions, Playback, QueueItem, Role, RoomSettings, RoomSnapshot, ServerMsg, TrackInfo,
 };
 use rand::seq::SliceRandom;
@@ -282,6 +282,39 @@ impl Room {
                 self.next_item += 1;
                 self.queue.push_back(QueueItem { id, track, added_by: me.name.clone(), added_by_id: from });
                 if self.playback.current.is_none() { self.advance(now_ms) } else { vec![self.queue_msg()] }
+            }
+            ClientMsg::QueueAddMany { mut tracks, mode } => {
+                if !perms.queue_manage {
+                    return deny("ajouter une liste entière (ajoute les titres un par un)");
+                }
+                if mode == AddMode::PlayNow && !perms.playback {
+                    return deny("lancer une liste à la place de la lecture en cours");
+                }
+                tracks.retain(|t| t.uri.starts_with("spotify:track:") && t.duration_ms > 0);
+                if tracks.is_empty() {
+                    return vec![error(from, ErrorCode::InvalidMessage, "aucun morceau jouable dans cette liste")];
+                }
+                if mode == AddMode::PlayNow {
+                    self.queue.clear();
+                }
+                let room_left = MAX_QUEUE_LEN.saturating_sub(self.queue.len());
+                let dropped = tracks.len().saturating_sub(room_left);
+                tracks.truncate(room_left);
+                for track in tracks {
+                    let id = self.next_item;
+                    self.next_item += 1;
+                    self.queue.push_back(QueueItem { id, track, added_by: me.name.clone(), added_by_id: from });
+                }
+                let mut outs = if mode == AddMode::PlayNow || self.playback.current.is_none() {
+                    self.advance(now_ms)
+                } else {
+                    vec![self.queue_msg()]
+                };
+                if dropped > 0 {
+                    let msg = format!("file pleine : {dropped} morceaux non ajoutés ({MAX_QUEUE_LEN} maximum)");
+                    outs.push(error(from, ErrorCode::Forbidden, &msg));
+                }
+                outs
             }
             ClientMsg::QueueRemove { id } => match self.queue.iter().position(|i| i.id == id) {
                 Some(index) => {
@@ -896,5 +929,33 @@ mod tests {
         assert_eq!(r2.snapshot().settings.autoplay.as_deref(), Some("Ma playlist"));
         r2.handle(host2, ClientMsg::Admin(AdminCmd::SetAutoplay { name: String::new(), tracks: vec![] }), 0);
         assert_eq!(r2.snapshot().settings.autoplay, None);
+    }
+
+    #[test]
+    fn playlists_are_added_in_bulk_by_queue_managers_only() {
+        let (mut r, host) = room();
+        let lou = guest(&mut r, "Lou");
+        let list = |n: u8| (1..=n).map(|i| track(i, 1000)).collect::<Vec<_>>();
+
+        assert!(forbidden(&r.handle(lou, ClientMsg::QueueAddMany { tracks: list(3), mode: AddMode::End }, 0)));
+
+        // Idle room: the first track starts, the rest is queued in order.
+        let outs = r.handle(host, ClientMsg::QueueAddMany { tracks: list(3), mode: AddMode::End }, 0);
+        assert_eq!(playback(&outs).unwrap().current.as_ref().unwrap().track.name, "T1");
+        let names = |r: &Room| r.snapshot().queue.iter().map(|i| i.track.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&r), ["T2", "T3"]);
+
+        // Play now: queue replaced, first track of the new list playing.
+        let mut other = list(2);
+        other.reverse();
+        let outs = r.handle(host, ClientMsg::QueueAddMany { tracks: other, mode: AddMode::PlayNow }, 10);
+        assert_eq!(playback(&outs).unwrap().current.as_ref().unwrap().track.name, "T2");
+        assert_eq!(names(&r), ["T1"]);
+
+        // A DJ without playback control can append but not take over.
+        let set = |perm, value| ClientMsg::Admin(AdminCmd::SetPerm { member: lou, perm, value });
+        r.handle(host, set(Perm::QueueManage, Some(true)), 0);
+        assert!(!forbidden(&r.handle(lou, ClientMsg::QueueAddMany { tracks: list(1), mode: AddMode::End }, 0)));
+        assert!(forbidden(&r.handle(lou, ClientMsg::QueueAddMany { tracks: list(1), mode: AddMode::PlayNow }, 0)));
     }
 }

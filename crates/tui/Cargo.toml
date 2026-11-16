@@ -15,6 +15,7 @@ image = { version = "0.25.10", default-features = false, features = ["jpeg", "pn
 mpris-server = { version = "0.11.0", features = ["tokio"] }
 notify = "8.2.2"
 protocol = { version = "0.1.0", path = "../protocol" }
+rand = "0.10.4"
 ratatui = "0.30.2"
 ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2"] }

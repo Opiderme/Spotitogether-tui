@@ -55,6 +55,7 @@ Dans un salon, l'interface plein écran se pilote au clavier et à la souris :
 | Touche | Action |
 | --- | --- |
 | `/` puis Entrée | chercher un morceau ; Entrée (ou clic) l'ajoute à la file |
+| `l` | ta bibliothèque (titres likés, playlists) : ajouter un titre (Entrée), toute la liste (`t`), la jouer tout de suite dans l'ordre (`p`) ou en aléatoire (`s`) |
 | espace, `s`, ← → | lecture/pause du salon, morceau suivant, ±10 s |
 | `j` `k`, `J` `K`, `d` | sélection, déplacement et retrait dans la file |
 | `r` | resynchroniser ton Spotify |
@@ -83,7 +84,7 @@ corrigée automatiquement.
 | --- | --- | --- | --- | --- |
 | Écouter en synchro | oui | oui | oui | non |
 | Ajouter à la file | oui | oui | oui, 2 en attente max | non |
-| Retirer / réordonner la file | oui | oui | ses propres ajouts | non |
+| Retirer / réordonner la file, ajouter une liste entière | oui | oui | ses propres ajouts | non |
 | Lecture, pause, position | oui | oui | non | non |
 | Passer le morceau | oui | oui | vote (majorité) | non |
 

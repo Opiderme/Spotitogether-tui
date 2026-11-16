@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use client::{Event, SyncEvent};
 use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use image::DynamicImage;
-use protocol::{AdminCmd, ClientMsg, Member, MemberId, Perm, Permissions, Playback, QueueItem, Role, RoomSettings, ServerMsg};
+use protocol::{AddMode, AdminCmd, ClientMsg, Member, MemberId, Perm, Permissions, Playback, QueueItem, Role, RoomSettings, ServerMsg};
 use ratatui::layout::{Position, Rect};
 use ratatui::widgets::{ListState, TableState};
 use spotify::models::{PlaylistSummary, Track};
@@ -24,6 +24,10 @@ pub enum Effect {
     Search { request: u64, query: String, offset: u32 },
     FetchCover(String),
     LoadPlaylists,
+    /// The member's playlists, for the library.
+    LoadLibrary,
+    /// Tracks of a library list.
+    LoadLibraryList { source: crate::library::Source, name: String },
     /// Copy the invite link to the clipboard.
     CopyInvite(String),
     LoadPlaylistTracks { id: String, name: String },
@@ -81,6 +85,8 @@ pub struct Areas {
     pub perm_rows: Rect,
     pub picker_popup: Rect,
     pub picker_rows: Rect,
+    pub library_popup: Rect,
+    pub library_rows: Rect,
     pub perm_cols: [(u16, u16); PERM_COLUMNS],
 }
 
@@ -143,6 +149,7 @@ pub struct App {
     pub votes: (u32, u32),
     pub perm_panel: Option<PermPanel>,
     pub playlist_picker: Option<PlaylistPicker>,
+    pub library: Option<crate::library::Library>,
     pub me: MemberId,
     pub playback: Playback,
     pub queue: Vec<QueueItem>,
@@ -184,6 +191,7 @@ impl App {
             votes: (0, 0),
             perm_panel: None,
             playlist_picker: None,
+            library: None,
             me: joined.member_id,
             playback: room.playback.clone(),
             queue: room.queue.clone(),
@@ -430,6 +438,9 @@ impl App {
         if self.playlist_picker.is_some() {
             return self.on_picker_key(key);
         }
+        if self.library.is_some() {
+            return self.on_library_key(key);
+        }
         if self.focus == Focus::Search && self.search.editing {
             return self.on_search_key(key);
         }
@@ -456,6 +467,7 @@ impl App {
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char(' ') => return self.toggle_play(),
             KeyCode::Char('s') => return self.skip_or_vote(),
+            KeyCode::Char('l') => return self.open_library(),
             KeyCode::Char('A') => {
                 if !self.is_host() {
                     self.toast("L'autoplay est choisi par l'hôte", Level::Warn);
@@ -559,6 +571,9 @@ impl App {
         }
         if self.playlist_picker.is_some() {
             return self.on_picker_mouse(m);
+        }
+        if self.library.is_some() {
+            return self.on_library_mouse(m);
         }
         let a = self.areas;
         match m.kind {
@@ -752,6 +767,194 @@ impl App {
             Command::Seek(offset_ms) => self.seek_relative(offset_ms),
             Command::SetPosition(ms) => self.seek_to(ms),
         }
+    }
+
+    // ------------------------------------------------------------ library
+
+    fn open_library(&mut self) -> Vec<Effect> {
+        if !self.can_play {
+            self.toast("La bibliothèque nécessite ton compte Spotify (pas en mode spectateur)", Level::Warn);
+            return vec![];
+        }
+        let mut library = crate::library::Library { loading: true, ..Default::default() };
+        library.state.select(Some(0));
+        self.library = Some(library);
+        vec![Effect::LoadLibrary]
+    }
+
+    pub fn on_library(&mut self, result: Result<Vec<PlaylistSummary>, String>) {
+        let Some(library) = self.library.as_mut() else { return };
+        library.loading = false;
+        match result {
+            Ok(playlists) => library.playlists = playlists,
+            Err(e) => self.toast(format!("Playlists : {e}"), Level::Bad),
+        }
+    }
+
+    pub fn on_library_list(&mut self, key: String, result: Result<Vec<Track>, String>) {
+        let Some(open) = self.library.as_mut().and_then(|l| l.open.as_mut()).filter(|o| o.key == key) else {
+            return; // closed or another list opened meanwhile
+        };
+        open.loading = false;
+        match result {
+            Ok(tracks) => {
+                open.state.select((!tracks.is_empty()).then_some(0));
+                open.tracks = tracks;
+            }
+            Err(e) => {
+                let text = format!("« {} » : {e}", open.name);
+                if let Some(library) = self.library.as_mut() {
+                    library.open = None;
+                }
+                self.toast(text, Level::Bad);
+            }
+        }
+    }
+
+    fn open_library_row(&mut self) -> Vec<Effect> {
+        let Some(library) = self.library.as_mut() else { return vec![] };
+        let Some((source, name, total)) = library.state.selected().and_then(|i| library.row(i)) else { return vec![] };
+        library.open = Some(crate::library::OpenList {
+            name: name.clone(),
+            key: source.key().to_owned(),
+            total,
+            loading: true,
+            ..Default::default()
+        });
+        vec![Effect::LoadLibraryList { source, name }]
+    }
+
+    fn on_library_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        use crate::library::step;
+        let Some(library) = self.library.as_mut() else { return vec![] };
+        let delta = match key.code {
+            KeyCode::Up | KeyCode::Char('k') => Some(-1),
+            KeyCode::Down | KeyCode::Char('j') => Some(1),
+            KeyCode::PageUp => Some(-10),
+            KeyCode::PageDown => Some(10),
+            _ => None,
+        };
+        if let Some(open) = library.open.as_mut() {
+            if let Some(d) = delta {
+                open.state.select(step(open.state.selected(), open.tracks.len(), d));
+                return vec![];
+            }
+            return match key.code {
+                KeyCode::Esc | KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
+                    library.open = None;
+                    vec![]
+                }
+                KeyCode::Char('l') | KeyCode::Char('q') => {
+                    self.library = None;
+                    vec![]
+                }
+                KeyCode::Enter | KeyCode::Char('a') => self.add_library_track(),
+                KeyCode::Char('t') => self.add_library_list(AddMode::End, false),
+                KeyCode::Char('p') => self.add_library_list(AddMode::PlayNow, false),
+                KeyCode::Char('s') => self.add_library_list(AddMode::PlayNow, true),
+                _ => vec![],
+            };
+        }
+        if let Some(d) = delta {
+            let rows = library.rows();
+            library.state.select(step(library.state.selected(), rows, d));
+            return vec![];
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('l') | KeyCode::Char('q') => {
+                self.library = None;
+                vec![]
+            }
+            KeyCode::Enter | KeyCode::Right => self.open_library_row(),
+            _ => vec![],
+        }
+    }
+
+    fn on_library_mouse(&mut self, m: MouseEvent) -> Vec<Effect> {
+        use crate::library::step;
+        let pos = Position::new(m.column, m.row);
+        let a = self.areas;
+        let Some(library) = self.library.as_mut() else { return vec![] };
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) if !a.library_popup.contains(pos) => self.library = None,
+            MouseEventKind::Down(MouseButton::Left) => {
+                // A click on the selected row opens the list / adds the track.
+                if let Some(open) = library.open.as_mut() {
+                    if let Some(i) = row_index(a.library_rows, pos, open.state.offset(), open.tracks.len()) {
+                        if open.state.selected() == Some(i) {
+                            return self.add_library_track();
+                        }
+                        open.state.select(Some(i));
+                    }
+                } else if let Some(i) = row_index(a.library_rows, pos, library.state.offset(), library.rows()) {
+                    if library.state.selected() == Some(i) {
+                        return self.open_library_row();
+                    }
+                    library.state.select(Some(i));
+                }
+            }
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                let d = if m.kind == MouseEventKind::ScrollDown { 1 } else { -1 };
+                match library.open.as_mut() {
+                    Some(open) => open.state.select(step(open.state.selected(), open.tracks.len(), d)),
+                    None => {
+                        let rows = library.rows();
+                        library.state.select(step(library.state.selected(), rows, d));
+                    }
+                }
+            }
+            _ => {}
+        }
+        vec![]
+    }
+
+    fn add_library_track(&mut self) -> Vec<Effect> {
+        let track = self
+            .library
+            .as_ref()
+            .and_then(|l| l.open.as_ref())
+            .and_then(|o| o.state.selected().and_then(|i| o.tracks.get(i)))
+            .cloned();
+        let Some(track) = track else { return vec![] };
+        if !self.allowed(self.my_perms().queue_add, "ajouter des morceaux") {
+            return vec![];
+        }
+        self.toast(format!("Ajouté : {} — {}", track.name, track.artist_names()), Level::Good);
+        vec![Effect::Send(ClientMsg::QueueAdd { track: client::track_info(&track) })]
+    }
+
+    /// Whole list: appended, or played right away (in order or shuffled).
+    fn add_library_list(&mut self, mode: AddMode, shuffle: bool) -> Vec<Effect> {
+        let perms = self.my_perms();
+        if !self.allowed(perms.queue_manage, "ajouter une liste entière (ajoute les titres un par un)") {
+            return vec![];
+        }
+        if mode == AddMode::PlayNow && !self.allowed(perms.playback, "lancer une liste à la place de la lecture en cours") {
+            return vec![];
+        }
+        let Some(open) = self.library.as_ref().and_then(|l| l.open.as_ref()).filter(|o| !o.loading) else {
+            return vec![];
+        };
+        let name = open.name.clone();
+        let mut tracks: Vec<_> = open.tracks.iter().map(client::track_info).collect();
+        if tracks.is_empty() {
+            self.toast(format!("« {name} » ne contient aucun morceau jouable"), Level::Warn);
+            return vec![];
+        }
+        if shuffle {
+            use rand::seq::SliceRandom;
+            tracks.shuffle(&mut rand::rng());
+        }
+        let text = match (mode, shuffle) {
+            (AddMode::End, _) => format!("« {name} » ajoutée à la file ({} titres)", tracks.len()),
+            (AddMode::PlayNow, false) => format!("Lecture de « {name} »"),
+            (AddMode::PlayNow, true) => format!("Lecture de « {name} » en aléatoire"),
+        };
+        self.toast(text, Level::Good);
+        if mode == AddMode::PlayNow {
+            self.library = None;
+        }
+        vec![Effect::Send(ClientMsg::QueueAddMany { tracks, mode })]
     }
 
     // ---------------------------------------------------- autoplay picker
@@ -1293,5 +1496,65 @@ mod tests {
         assert_eq!(a.on_key(key(KeyCode::Char('i'))), [Effect::CopyInvite("spotitogether://192.168.1.19:7420/NEW123".into())]);
         a.hosting = false;
         assert_eq!(a.on_key(key(KeyCode::Char('q'))), [Effect::Quit], "guests quit at once");
+    }
+
+    #[test]
+    fn library_queues_tracks_or_plays_whole_lists() {
+        use crate::library::Source;
+        let mut a = app();
+        assert_eq!(a.on_key(key(KeyCode::Char('l'))), [Effect::LoadLibrary]);
+        a.on_library(Ok(vec![serde_json::from_value(serde_json::json!({"id": "p1", "name": "Soirée", "items": {"total": 3}})).unwrap()]));
+        a.on_key(key(KeyCode::Down));
+        assert_eq!(a.on_key(key(KeyCode::Enter)), [Effect::LoadLibraryList { source: Source::Playlist { id: "p1".into() }, name: "Soirée".into() }]);
+
+        let tracks: Vec<Track> = (1..=3)
+            .map(|n| Track { uri: format!("spotify:track:{n}"), name: format!("S{n}"), duration_ms: 1000, ..Default::default() })
+            .collect();
+        a.on_library_list("liked".into(), Ok(vec![])); // stale answer, ignored
+        a.on_library_list("p1".into(), Ok(tracks));
+        a.on_key(key(KeyCode::Down));
+        assert!(matches!(sent(&a.on_key(key(KeyCode::Enter)))[..], [ClientMsg::QueueAdd { track }] if track.name == "S2"));
+        assert!(matches!(sent(&a.on_key(key(KeyCode::Char('t'))))[..], [ClientMsg::QueueAddMany { tracks, mode: AddMode::End }] if tracks.len() == 3));
+        let fx = a.on_key(key(KeyCode::Char('s')));
+        assert!(matches!(sent(&fx)[..], [ClientMsg::QueueAddMany { tracks, mode: AddMode::PlayNow }] if tracks.len() == 3));
+        assert!(a.library.is_none(), "closes once the list plays");
+
+        // A listener can add one track but not take over the queue.
+        a.me = 2;
+        a.on_key(key(KeyCode::Char('l')));
+        a.on_key(key(KeyCode::Enter)); // liked songs
+        a.on_library_list("liked".into(), Ok(vec![Track { uri: "spotify:track:x".into(), name: "X".into(), duration_ms: 1, ..Default::default() }]));
+        assert_eq!(sent(&a.on_key(key(KeyCode::Enter))).len(), 1);
+        assert!(a.on_key(key(KeyCode::Char('p'))).is_empty());
+        assert!(a.active_toast().unwrap().0.contains("ne permet pas"));
+        a.on_key(key(KeyCode::Esc));
+        assert!(a.library.as_ref().unwrap().open.is_none(), "Esc goes back to the lists");
+    }
+
+    #[test]
+    fn renders_library() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut a = app();
+        a.on_key(key(KeyCode::Char('l')));
+        a.on_library(Ok(vec![serde_json::from_value(serde_json::json!({"id": "p1", "name": "Klassique", "items": {"total": 92}})).unwrap()]));
+        let draw = |a: &mut App| {
+            let mut terminal = Terminal::new(TestBackend::new(110, 34)).unwrap();
+            terminal.draw(|f| crate::ui::draw(f, a)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            (0..buf.area.height)
+                .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_owned()).collect::<String>() + "\n")
+                .collect::<String>()
+        };
+        let text = draw(&mut a);
+        assert!(text.contains("Titres likés") && text.contains("Klassique") && text.contains("92 titres"), "{text}");
+        a.on_key(key(KeyCode::Down));
+        a.on_key(key(KeyCode::Enter));
+        a.on_library_list("p1".into(), Ok(vec![Track { uri: "spotify:track:c".into(), name: "Cello Suite No. 1".into(), duration_ms: 150_000, ..Default::default() }]));
+        let text = draw(&mut a);
+        println!("{text}");
+        for needle in ["Bibliothèque › Klassique", "1 titres (les 1 premiers sur 92)", "Cello Suite No. 1", "jouer en aléatoire"] {
+            assert!(text.contains(needle), "{needle} missing");
+        }
     }
 }

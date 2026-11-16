@@ -3,6 +3,7 @@
 
 mod app;
 mod cover;
+mod library;
 pub mod launcher;
 mod mpris;
 mod theme;
@@ -29,6 +30,8 @@ const FRAME_EVERY: Duration = Duration::from_millis(250);
 enum Loaded {
     Playlists(Result<Vec<spotify::models::PlaylistSummary>, String>),
     PlaylistTracks { name: String, result: Result<Vec<spotify::models::Track>, String> },
+    Library(Result<Vec<spotify::models::PlaylistSummary>, String>),
+    LibraryList { key: String, result: Result<Vec<spotify::models::Track>, String> },
 }
 
 /// How the room screen was opened.
@@ -125,6 +128,29 @@ async fn event_loop(
                         });
                     }
                 }
+                Effect::LoadLibrary => {
+                    if let Some(sp) = spotify.clone() {
+                        let tx = loaded_tx.clone();
+                        tokio::spawn(async move {
+                            let result = sp.my_playlists().await.map_err(|e| e.to_string());
+                            let _ = tx.send(Loaded::Library(result));
+                        });
+                    }
+                }
+                Effect::LoadLibraryList { source, name: _ } => {
+                    if let Some(sp) = spotify.clone() {
+                        let tx = loaded_tx.clone();
+                        tokio::spawn(async move {
+                            let max = library::MAX_TRACKS;
+                            let result = match &source {
+                                library::Source::Liked => sp.saved_tracks(max).await,
+                                library::Source::Playlist { id } => sp.playlist_tracks(id, max).await,
+                            };
+                            let key = source.key().to_owned();
+                            let _ = tx.send(Loaded::LibraryList { key, result: result.map_err(|e| e.to_string()) });
+                        });
+                    }
+                }
                 Effect::LoadPlaylistTracks { id, name } => {
                     if let Some(sp) = spotify.clone() {
                         let tx = loaded_tx.clone();
@@ -169,6 +195,8 @@ async fn event_loop(
             Some(loaded) = loaded_rx.recv() => match loaded {
                 Loaded::Playlists(result) => { app.on_playlists(result); vec![] }
                 Loaded::PlaylistTracks { name, result } => app.on_playlist_tracks(name, result),
+                Loaded::Library(result) => { app.on_library(result); vec![] }
+                Loaded::LibraryList { key, result } => { app.on_library_list(key, result); vec![] }
             },
             Some(cmd) = mpris_cmd_rx.recv() => app.on_mpris(cmd),
             _ = frame.tick() => {

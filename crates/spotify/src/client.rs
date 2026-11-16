@@ -173,15 +173,22 @@ impl SpotifyClient {
     /// Since 2026, Development Mode only returns the items of playlists the
     /// user owns or collaborates on.
     pub async fn playlist_tracks(&self, id: &str, max: usize) -> Result<Vec<Track>> {
+        self.collect_tracks(&format!("/playlists/{id}/items"), max).await
+    }
+
+    /// The user's liked songs, most recent first, up to `max`.
+    pub async fn saved_tracks(&self, max: usize) -> Result<Vec<Track>> {
+        self.collect_tracks("/me/tracks", max).await
+    }
+
+    /// Pages through a list of `{item|track}` entries, keeping playable tracks.
+    async fn collect_tracks(&self, path: &str, max: usize) -> Result<Vec<Track>> {
         const PAGE: usize = 50;
         let mut tracks = Vec::new();
         let mut offset = 0;
         loop {
             let page: Paging<PlaylistEntry> = self
-                .get_json(
-                    &format!("/playlists/{id}/items"),
-                    &[("limit", PAGE.to_string()), ("offset", offset.to_string())],
-                )
+                .get_json(path, &[("limit", PAGE.to_string()), ("offset", offset.to_string())])
                 .await?;
             let count = page.items.len();
             tracks.extend(

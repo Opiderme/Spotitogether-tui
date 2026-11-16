@@ -42,6 +42,9 @@ pub enum ClientMsg {
     /// Clock sync: `t0` is the client's wall clock in ms, echoed back.
     Ping { t0: u64 },
     QueueAdd { track: TrackInfo },
+    /// Several tracks at once (a playlist), in the given order. Needs
+    /// `QueueManage`; `PlayNow` also needs `Playback`.
+    QueueAddMany { tracks: Vec<TrackInfo>, mode: AddMode },
     QueueRemove { id: ItemId },
     /// Moves an item to `index` (0 = next to play).
     QueueMove { id: ItemId, index: usize },
@@ -55,6 +58,16 @@ pub enum ClientMsg {
     VoteSkip,
     /// Host only.
     Admin(AdminCmd),
+}
+
+/// Where `QueueAddMany` puts the tracks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AddMode {
+    /// After the tracks already queued.
+    End,
+    /// Replaces the queue and starts the first track right away.
+    PlayNow,
 }
 
 /// Room administration, reserved to the host.

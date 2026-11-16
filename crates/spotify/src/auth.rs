@@ -20,7 +20,7 @@ use crate::{Error, Result};
 pub const CALLBACK_PORT: u16 = 8973;
 pub const REDIRECT_URI: &str = "http://127.0.0.1:8973/callback";
 pub const SCOPES: &str = "user-read-playback-state user-modify-playback-state user-read-currently-playing \
-                          playlist-read-private playlist-read-collaborative";
+                          playlist-read-private playlist-read-collaborative user-library-read";
 
 const AUTHORIZE_URL: &str = "https://accounts.spotify.com/authorize";
 pub(crate) const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";

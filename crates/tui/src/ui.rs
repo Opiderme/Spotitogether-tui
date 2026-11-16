@@ -38,6 +38,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.playlist_picker.is_some() {
         draw_picker(f, app, area);
     }
+    if app.library.is_some() {
+        draw_library(f, app, area);
+    }
     if app.show_help {
         draw_help(f, app, area);
     }
@@ -160,7 +163,7 @@ fn draw_cover(f: &mut Frame, app: &mut App, area: Rect) {
     }
     // Pictures are drawn over the cells by the terminal and could show
     // through popups: characters while one is open.
-    let popup_open = app.show_help || app.perm_panel.is_some() || app.playlist_picker.is_some();
+    let popup_open = app.show_help || app.perm_panel.is_some() || app.playlist_picker.is_some() || app.library.is_some();
     if app.cover_mode == crate::cover::CoverMode::Image
         && !popup_open
         && let Some(protocol) = app.cover_image.as_mut()
@@ -324,7 +327,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         _ => app.settings.code.clone(),
     };
     let left = format!(
-        " {room} │ {} membre{} │ {me}{role} │ / chercher  espace pause  s suivant  ? aide  q quitter",
+        " {room} │ {} membre{} │ {me}{role} │ / chercher  l bibliothèque  espace pause  s suivant  ? aide  q quitter",
         app.members.len(),
         if app.members.len() > 1 { "s" } else { "" },
     );
@@ -339,7 +342,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
 fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme;
     let w = 64.min(area.width);
-    let h = 25.min(area.height);
+    let h = 26.min(area.height);
     let popup = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
     f.render_widget(Clear, popup);
     let key = |k: &str, what: &str| Line::from(vec![Span::raw(format!("  {k:<14}")).fg(t.accent), Span::raw(what.to_owned()).fg(t.text)]);
@@ -358,6 +361,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         key("r", "resynchroniser ton Spotify"),
         key("c", "pochette : ascii / blocs"),
         key("p", "permissions des membres (hôte)"),
+        key("l", "ta bibliothèque : titres likés et playlists"),
         key("A", "playlist d'autoplay (hôte)"),
         key("i", "copier le lien d'invitation"),
         key("q  Ctrl+C", "quitter le salon"),
@@ -517,4 +521,99 @@ fn draw_picker(f: &mut Frame, app: &mut App, area: Rect) {
     );
     app.areas.picker_popup = popup;
     app.areas.picker_rows = list;
+}
+
+fn draw_library(f: &mut Frame, app: &mut App, area: Rect) {
+    let t = app.theme;
+    let perms = app.my_perms();
+    let Some(library) = app.library.as_mut() else { return };
+    let w = 100.min(area.width.saturating_sub(4)).max(40.min(area.width));
+    let h = (area.height * 4 / 5).max(12.min(area.height));
+    let popup = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
+    f.render_widget(Clear, popup);
+    let title = match &library.open {
+        Some(open) => format!(" Bibliothèque › {} ", open.name),
+        None => " Bibliothèque ".to_owned(),
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(t.accent))
+        .title(Line::from(title).fg(t.accent).bold())
+        .title(Line::from(" Échap retour/fermer ").fg(t.muted).right_aligned());
+    let inner = block.inner(popup).inner(Margin::new(1, 0));
+    f.render_widget(block, popup);
+    let [head, list, help] =
+        Layout::vertical([Constraint::Length(2), Constraint::Min(1), Constraint::Length(2)]).areas(inner);
+    app.areas.library_popup = popup;
+    app.areas.library_rows = list;
+
+    let key = |k: &str, label: &str, ok: bool| {
+        vec![
+            Span::raw(format!("{k} ")).fg(if ok { t.accent } else { t.border }),
+            Span::raw(format!("{label}   ")).fg(if ok { t.text } else { t.border }),
+        ]
+    };
+
+    match library.open.as_mut() {
+        None => {
+            f.render_widget(Paragraph::new(Line::from("Tes titres likés et tes playlists").fg(t.muted)), head);
+            if library.loading {
+                f.render_widget(Paragraph::new(Line::from("Chargement de tes playlists…").fg(t.muted)), list);
+            } else {
+                let mut items = vec![ListItem::new(Line::from(vec![
+                    Span::raw("♥ ").fg(t.bad),
+                    Span::raw("Titres likés").fg(t.text).bold(),
+                ]))];
+                items.extend(library.playlists.iter().map(|p| {
+                    ListItem::new(Line::from(vec![
+                        Span::raw("♪ ").fg(t.accent),
+                        Span::raw(p.name.clone()).fg(t.text),
+                        Span::raw(format!("  {} titres", p.items.total)).fg(t.muted),
+                    ]))
+                }));
+                let widget = List::new(items).highlight_style(Style::new().bg(t.selection).bold()).highlight_symbol("› ");
+                f.render_stateful_widget(widget, list, &mut library.state);
+            }
+            let mut spans = key("Entrée", "ouvrir", true);
+            spans.extend(key("↑↓", "choisir", true));
+            spans.extend(key("Échap", "fermer", true));
+            f.render_widget(Paragraph::new(Line::from(spans)), help);
+        }
+        Some(open) => {
+            let count = match (open.loading, open.total) {
+                (true, _) => "chargement…".to_owned(),
+                (false, Some(total)) if total as usize > open.tracks.len() => {
+                    format!("{} titres (les {} premiers sur {total})", open.tracks.len(), open.tracks.len())
+                }
+                (false, _) => format!("{} titres", open.tracks.len()),
+            };
+            f.render_widget(Paragraph::new(Line::from(count).fg(t.muted)), head);
+            if open.loading {
+                f.render_widget(Paragraph::new(Line::from("Chargement des titres…").fg(t.muted)), list);
+            } else {
+                let rows = open.tracks.iter().enumerate().map(|(i, track)| {
+                    Row::new::<Vec<ratatui::widgets::Cell>>(vec![
+                        format!("{:>3}", i + 1).fg(t.muted).into(),
+                        track.name.clone().fg(t.text).into(),
+                        track.artist_names().fg(t.muted).into(),
+                        fmt_ms(track.duration_ms).fg(t.muted).into(),
+                    ])
+                });
+                let table = Table::new(
+                    rows,
+                    [Constraint::Length(3), Constraint::Percentage(50), Constraint::Percentage(35), Constraint::Length(6)],
+                )
+                .row_highlight_style(Style::new().bg(t.selection).add_modifier(Modifier::BOLD))
+                .highlight_symbol("› ")
+                .highlight_spacing(HighlightSpacing::Always);
+                f.render_stateful_widget(table, list, &mut open.state);
+            }
+            let mut first = key("Entrée", "ajouter le titre", perms.queue_add);
+            first.extend(key("t", "tout ajouter à la file", perms.queue_manage));
+            let mut second = key("p", "jouer la liste", perms.queue_manage && perms.playback);
+            second.extend(key("s", "jouer en aléatoire", perms.queue_manage && perms.playback));
+            second.extend(key("Échap", "retour", true));
+            f.render_widget(Paragraph::new(vec![Line::from(first), Line::from(second)]), help);
+        }
+    }
 }
