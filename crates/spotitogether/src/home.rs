@@ -29,16 +29,42 @@ pub async fn run(invite: Option<String>) -> Result<()> {
     let mut profile: Option<Profile> = None;
     loop {
         let mut config = Config::load()?;
-        let account = account(&config, &mut profile, &mut message).await;
+        // The home screen shows at once; the Spotify account (keyring and a
+        // network request) is checked in the background.
+        let (account, mut check, account_check) = match (&profile, &config.client_id) {
+            (Some((_, me)), _) => (Account::Ready(display_name(me)), None, None),
+            (None, None) => (Account::NotConfigured, None, None),
+            (None, Some(client_id)) => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let client_id = client_id.clone();
+                let task = tokio::spawn(async move {
+                    let (account, profile, message) = check_account(client_id).await;
+                    let _ = tx.send((account, message));
+                    profile
+                });
+                (Account::Checking, Some(task), Some(rx))
+            }
+        };
         let info = LauncherInfo {
             account,
             invite: prefill.take().or_else(|| config.last_invite.clone()).unwrap_or_default(),
             message: message.take(),
             auto_join,
+            account_check,
         };
         auto_join = false;
 
-        match tui::launcher::run(info).await? {
+        let choice = tui::launcher::run(info).await?;
+        // Creating or joining needs the profile: wait for the check if it is
+        // still running (usually already done).
+        if let Some(task) = check.take() {
+            if choice == LauncherChoice::Quit {
+                task.abort();
+            } else {
+                profile = task.await.ok().flatten();
+            }
+        }
+        match choice {
             LauncherChoice::Quit => return Ok(()),
             LauncherChoice::Setup => {
                 if let Err(e) = crate::setup(None) {
@@ -77,31 +103,15 @@ pub async fn run(invite: Option<String>) -> Result<()> {
     }
 }
 
-/// Spotify account state; the profile is cached between home screens.
-async fn account(config: &Config, profile: &mut Option<Profile>, message: &mut Option<(String, bool)>) -> Account {
-    if let Some((_, me)) = profile {
-        return Account::Ready(display_name(me));
-    }
-    if config.client_id.is_none() {
-        return Account::NotConfigured;
-    }
-    if !matches!(secrets::load(), Ok(Some(_))) {
-        return Account::NotLoggedIn;
-    }
-    let client = match spotify_cmd::connect() {
-        Ok(c) => Arc::new(c),
-        Err(_) => return Account::NotLoggedIn,
-    };
+/// Spotify account: one keyring read (blocking D-Bus call, off the async
+/// threads) and the profile request.
+async fn check_account(client_id: String) -> (Account, Option<Profile>, Option<(String, bool)>) {
+    let token = tokio::task::spawn_blocking(secrets::load).await.ok().and_then(|r| r.ok()).flatten();
+    let Some(token) = token else { return (Account::NotLoggedIn, None, None) };
+    let client = Arc::new(spotify_cmd::client_from(client_id, token));
     match client.me().await {
-        Ok(me) => {
-            let name = display_name(&me);
-            *profile = Some((client, me));
-            Account::Ready(name)
-        }
-        Err(e) => {
-            message.get_or_insert((format!("Spotify : {e}"), true));
-            Account::NotLoggedIn
-        }
+        Ok(me) => (Account::Ready(display_name(&me)), Some((client, me)), None),
+        Err(e) => (Account::NotLoggedIn, None, Some((format!("Spotify : {e}"), true))),
     }
 }
 
@@ -195,8 +205,10 @@ async fn host(profile: Option<Profile>) -> Result<Option<String>> {
 
     let _ = stop.send(());
     let _ = tokio::time::timeout(Duration::from_secs(3), server).await;
+    // Closing the peer-to-peer endpoint can take a moment: not on the way
+    // back to the home screen.
     if let Ok(t) = tunnel {
-        t.close().await;
+        tokio::spawn(t.close());
     }
     result
 }
@@ -238,7 +250,7 @@ async fn join(invite_text: &str, profile: Option<Profile>) -> Result<Option<Stri
     let options = tui::RunOptions { invite: Some(invite_text.to_owned()), hosting: false, notice: None };
     let result = tui::run(joined, spotify, options).await;
     if let Some(t) = tunnel {
-        t.close().await;
+        tokio::spawn(t.close());
     }
     result
 }

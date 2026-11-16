@@ -159,17 +159,22 @@ fn cache_path(url: &str) -> Option<PathBuf> {
     Some(dirs.cache_dir().join("covers").join(id))
 }
 
+/// JPEG decoding is CPU work: on a blocking thread, not an async worker.
+async fn decode(bytes: Vec<u8>) -> anyhow::Result<DynamicImage> {
+    Ok(tokio::task::spawn_blocking(move || image::load_from_memory(&bytes)).await??)
+}
+
 /// Loads a cover from the cache or downloads it.
 pub async fn fetch(http: &reqwest::Client, url: &str) -> anyhow::Result<DynamicImage> {
     let path = cache_path(url);
     if let Some(p) = &path
         && let Ok(bytes) = tokio::fs::read(p).await
-        && let Ok(img) = image::load_from_memory(&bytes)
+        && let Ok(img) = decode(bytes).await
     {
         return Ok(img);
     }
     let bytes = http.get(url).send().await?.error_for_status()?.bytes().await?;
-    let img = image::load_from_memory(&bytes)?;
+    let img = decode(bytes.to_vec()).await?;
     if let Some(p) = path {
         if let Some(dir) = p.parent() {
             let _ = tokio::fs::create_dir_all(dir).await;

@@ -705,7 +705,7 @@ fn draw_picker(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_library(f: &mut Frame, app: &mut App, area: Rect) {
     let t = app.theme;
     let perms = app.my_perms();
-    let liked = app.liked.clone();
+    let liked = &app.liked;
     let Some(library) = app.library.as_mut() else { return };
     let w = 100.min(area.width.saturating_sub(4)).max(40.min(area.width));
     let h = (area.height * 4 / 5).max(12.min(area.height));

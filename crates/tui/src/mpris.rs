@@ -31,30 +31,25 @@ pub enum Command {
     SetPosition(u64),
 }
 
-/// Starts the D-Bus player. Returns `None` when there is no session bus.
+/// Starts the D-Bus player in the background (the room screen does not wait
+/// for the bus). Without a session bus the thread just ends and updates go
+/// nowhere.
 pub fn spawn(commands: mpsc::UnboundedSender<Command>) -> Option<mpsc::UnboundedSender<Update>> {
     let (tx, rx) = mpsc::unbounded_channel();
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("mpris".into())
         .spawn(move || {
-            let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
-                let _ = ready_tx.send(false);
-                return;
-            };
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
             let local = tokio::task::LocalSet::new();
-            local.block_on(&rt, serve(commands, rx, ready_tx));
+            local.block_on(&rt, serve(commands, rx));
         })
         .ok()?;
-    // Wait for the bus registration so failures are reported (and ignored)
-    // before the TUI starts.
-    ready_rx.recv_timeout(std::time::Duration::from_secs(2)).ok().filter(|ok| *ok).map(|_| tx)
+    Some(tx)
 }
 
 async fn serve(
     commands: mpsc::UnboundedSender<Command>,
     mut updates: mpsc::UnboundedReceiver<Update>,
-    ready: std::sync::mpsc::Sender<bool>,
 ) {
     // One bus name per process: host and guest can run on the same machine.
     let suffix = format!("spotitogether.instance{}", std::process::id());
@@ -68,11 +63,9 @@ async fn serve(
         Ok(p) => p,
         Err(e) => {
             tracing::info!(%e, "MPRIS unavailable");
-            let _ = ready.send(false);
             return;
         }
     };
-    let _ = ready.send(true);
 
     let send = |c: Command| {
         let tx = commands.clone();

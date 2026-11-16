@@ -154,11 +154,16 @@ pub(crate) fn connect() -> Result<SpotifyClient> {
     let config = Config::load()?;
     let client_id = config.require_client_id()?.to_owned();
     let token = secrets::load()?.context("pas connecté à Spotify : lance `spotitogether login`")?;
-    Ok(SpotifyClient::new(client_id, token).with_token_sink(Box::new(|t| {
+    Ok(client_from(client_id, token))
+}
+
+/// Client for an already loaded token; refreshed tokens are saved.
+pub(crate) fn client_from(client_id: String, token: spotify::Token) -> SpotifyClient {
+    SpotifyClient::new(client_id, token).with_token_sink(Box::new(|t| {
         if let Err(err) = secrets::save(t) {
             tracing::warn!(%err, "could not persist refreshed token");
         }
-    })))
+    }))
 }
 
 fn join_query(parts: &[String]) -> Result<String> {

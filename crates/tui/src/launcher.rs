@@ -20,6 +20,8 @@ use crate::theme::Theme;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Account {
+    /// Being checked in the background (keyring, Spotify profile).
+    Checking,
     /// Logged in to Spotify as this display name.
     Ready(String),
     /// Client ID configured, no token (or an expired one).
@@ -27,6 +29,9 @@ pub enum Account {
     /// No Spotify app configured yet.
     NotConfigured,
 }
+
+/// Outcome of the background account check, with a message to show.
+pub type AccountCheck = (Account, Option<(String, bool)>);
 
 pub struct LauncherInfo {
     pub account: Account,
@@ -36,6 +41,9 @@ pub struct LauncherInfo {
     pub message: Option<(String, bool)>,
     /// Join `invite` right away (link opened from outside).
     pub auto_join: bool,
+    /// Result of a background account check (`account` is `Checking`),
+    /// with an optional message to show.
+    pub account_check: Option<tokio::sync::oneshot::Receiver<AccountCheck>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -70,16 +78,11 @@ pub struct Launcher {
 }
 
 impl Launcher {
-    pub fn new(info: LauncherInfo, theme: Theme) -> Self {
-        let mut items = match info.account {
-            Account::NotConfigured => vec![Item::Setup],
-            Account::NotLoggedIn => vec![Item::Login],
-            Account::Ready(_) => vec![],
-        };
-        items.extend([Item::Host, Item::Join, Item::Quit]);
+    pub fn new(mut info: LauncherInfo, theme: Theme) -> Self {
+        info.account_check = None;
         Self {
+            items: Self::items_for(&info.account),
             account: info.account,
-            items,
             selected: 0,
             invite: info.invite,
             editing: false,
@@ -87,6 +90,29 @@ impl Launcher {
             theme,
             item_rows: vec![],
             input: Rect::default(),
+        }
+    }
+
+    fn items_for(account: &Account) -> Vec<Item> {
+        let mut items = match account {
+            Account::NotConfigured => vec![Item::Setup],
+            Account::NotLoggedIn => vec![Item::Login],
+            Account::Ready(_) | Account::Checking => vec![],
+        };
+        items.extend([Item::Host, Item::Join, Item::Quit]);
+        items
+    }
+
+    /// The background check finished: update the menu, keeping the
+    /// selected entry.
+    pub fn set_account(&mut self, account: Account, message: Option<(String, bool)>) {
+        let selected = self.current();
+        self.items = Self::items_for(&account);
+        self.account = account;
+        self.selected = 0;
+        self.select(selected);
+        if self.message.is_none() {
+            self.message = message;
         }
     }
 
@@ -214,6 +240,7 @@ impl Launcher {
                 Span::raw(name.clone()).fg(t.text).bold(),
                 Span::raw("  ●").fg(t.good),
             ]),
+            Account::Checking => Line::from("Compte Spotify : vérification…").fg(t.muted),
             Account::NotLoggedIn => Line::from("Compte Spotify : non connecté (tu peux rejoindre en spectateur)").fg(t.warn),
             Account::NotConfigured => Line::from("Spotify n'est pas encore configuré (tu peux rejoindre en spectateur)").fg(t.warn),
         };
@@ -274,10 +301,11 @@ impl Launcher {
 }
 
 /// Shows the home screen until the user picks something.
-pub async fn run(info: LauncherInfo) -> Result<LauncherChoice> {
+pub async fn run(mut info: LauncherInfo) -> Result<LauncherChoice> {
     if info.auto_join && !info.invite.trim().is_empty() {
         return Ok(LauncherChoice::Join { invite: info.invite.trim().to_owned() });
     }
+    let mut check = info.account_check.take();
     let mut launcher = Launcher::new(info, Theme::load());
     let mut terminal = ratatui::init();
     let _ = execute!(stdout(), EnableMouseCapture, EnableBracketedPaste);
@@ -286,14 +314,22 @@ pub async fn run(info: LauncherInfo) -> Result<LauncherChoice> {
         if let Err(e) = terminal.draw(|f| launcher.draw(f)) {
             break Err(e.into());
         }
-        match events.next().await {
-            Some(Ok(event)) => {
-                if let Some(choice) = launcher.on_event(event) {
-                    break Ok(choice);
+        tokio::select! {
+            event = events.next() => match event {
+                Some(Ok(event)) => {
+                    if let Some(choice) = launcher.on_event(event) {
+                        break Ok(choice);
+                    }
+                }
+                Some(Err(e)) => break Err(e.into()),
+                None => break Ok(LauncherChoice::Quit),
+            },
+            result = async { check.as_mut().expect("guarded").await }, if check.is_some() => {
+                check = None;
+                if let Ok((account, message)) = result {
+                    launcher.set_account(account, message);
                 }
             }
-            Some(Err(e)) => break Err(e.into()),
-            None => break Ok(LauncherChoice::Quit),
         }
     };
     let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
@@ -306,7 +342,7 @@ mod tests {
     use super::*;
 
     fn launcher(account: Account, invite: &str) -> Launcher {
-        Launcher::new(LauncherInfo { account, invite: invite.into(), message: None, auto_join: false }, Theme::default())
+        Launcher::new(LauncherInfo { account, invite: invite.into(), message: None, auto_join: false, account_check: None }, Theme::default())
     }
 
     fn key(c: KeyCode) -> Event {
@@ -369,5 +405,16 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
         assert_eq!(l.on_event(click), Some(LauncherChoice::Quit));
+    }
+
+    #[test]
+    fn background_check_updates_the_menu_and_keeps_the_selection() {
+        let mut l = launcher(Account::Checking, "");
+        assert_eq!(l.items, [Item::Host, Item::Join, Item::Quit]);
+        l.on_event(key(KeyCode::Down)); // Join
+        l.set_account(Account::NotLoggedIn, Some(("Spotify : jeton expiré".into(), true)));
+        assert_eq!(l.items[0], Item::Login);
+        assert_eq!(l.current(), Item::Join, "selection kept");
+        assert!(l.message.is_some());
     }
 }

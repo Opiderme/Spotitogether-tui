@@ -352,22 +352,28 @@ impl LyricsScreen {
 
     /// Advances to `pos_ms`, placing new lines in `stage`.
     pub fn update(&mut self, pos_ms: u64, stage: Rect) {
-        let Some(lines) = self.lines().map(<[Line]>::to_vec) else { return };
+        if self.lines().is_none() {
+            return;
+        }
         // Seeking backwards: start over.
         if pos_ms + 1500 < self.last_pos {
             self.placed.clear();
             self.current = None;
         }
         self.last_pos = pos_ms;
-        let current = Self::index_at(&lines, pos_ms);
+        // Runs 30 times a second: only the new line is copied.
+        let lines = self.lines().unwrap_or_default();
+        let current = Self::index_at(lines, pos_ms);
+        let new_line = current.filter(|_| current != self.current).map(|i| (i, lines[i].text.clone()));
         if current != self.current {
-            if let Some(i) = current
+            if let Some((i, text)) = new_line
                 && self.style != KARAOKE
             {
-                self.place(i, &lines[i].text, stage);
+                self.place(i, &text, stage);
             }
             self.current = current;
         }
+        let Status::Ready(Lyrics::Timed { lines, .. }) = &self.status else { return };
         let style = self.style;
         self.placed.retain(|p| {
             let end = lines.get(p.index + 1).map_or(u64::MAX, |l| l.at_ms);
