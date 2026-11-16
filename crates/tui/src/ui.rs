@@ -619,44 +619,73 @@ fn draw_library(f: &mut Frame, app: &mut App, area: Rect) {
         ]
     };
 
+    // "/ filtre█   3 / 92" on the head line.
+    let filter_line = |filter: &crate::library::Filter, count: String, placeholder: &str| {
+        let mut spans = vec![Span::raw("/ ").fg(t.accent)];
+        match (filter.is_active(), filter.editing) {
+            (false, false) => spans.push(Span::raw(placeholder.to_owned()).fg(t.muted)),
+            _ => {
+                spans.push(Span::raw(filter.text.clone()).fg(t.text));
+                if filter.editing {
+                    spans.push(Span::raw("█").fg(t.accent));
+                }
+            }
+        }
+        spans.push(Span::raw(format!("   {count}")).fg(t.muted));
+        Line::from(spans)
+    };
+
     match library.open.as_mut() {
         None => {
-            f.render_widget(Paragraph::new(Line::from("Tes titres likés et tes playlists").fg(t.muted)), head);
+            let visible = library.visible();
+            let count = if library.filter.is_active() {
+                format!("{} / {} listes", visible.len(), library.rows())
+            } else {
+                format!("{} listes", library.rows())
+            };
+            f.render_widget(Paragraph::new(filter_line(&library.filter, count, "filtrer tes playlists")), head);
             if library.loading {
                 f.render_widget(Paragraph::new(Line::from("Chargement de tes playlists…").fg(t.muted)), list);
+            } else if visible.is_empty() {
+                f.render_widget(Paragraph::new(Line::from("Aucune liste ne correspond au filtre.").fg(t.muted)), list);
             } else {
-                let mut items = vec![ListItem::new(Line::from(vec![
-                    Span::raw("♥ ").fg(t.bad),
-                    Span::raw("Titres likés").fg(t.text).bold(),
-                ]))];
-                items.extend(library.playlists.iter().map(|p| {
+                let items = visible.iter().filter_map(|&i| library.row(i)).map(|(source, name, total)| {
+                    let liked = source == crate::library::Source::Liked;
                     ListItem::new(Line::from(vec![
-                        Span::raw("♪ ").fg(t.accent),
-                        Span::raw(p.name.clone()).fg(t.text),
-                        Span::raw(format!("  {} titres", p.items.total)).fg(t.muted),
+                        if liked { Span::raw("♥ ").fg(t.bad) } else { Span::raw("♪ ").fg(t.accent) },
+                        if liked { Span::raw(name).fg(t.text).bold() } else { Span::raw(name).fg(t.text) },
+                        Span::raw(total.map(|n| format!("  {n} titres")).unwrap_or_default()).fg(t.muted),
                     ]))
-                }));
-                let widget = List::new(items).highlight_style(Style::new().bg(t.selection).bold()).highlight_symbol("› ");
+                });
+                let widget = List::new(items.collect::<Vec<_>>())
+                    .highlight_style(Style::new().bg(t.selection).bold())
+                    .highlight_symbol("› ");
                 f.render_stateful_widget(widget, list, &mut library.state);
             }
             let mut spans = key("Entrée", "ouvrir", true);
+            spans.extend(key("/", "filtrer", true));
             spans.extend(key("↑↓", "choisir", true));
-            spans.extend(key("Échap", "fermer", true));
+            spans.extend(key("Échap", if library.filter.is_active() { "effacer le filtre" } else { "fermer" }, true));
             f.render_widget(Paragraph::new(Line::from(spans)), help);
         }
         Some(open) => {
-            let count = match (open.loading, open.total) {
+            let visible = open.visible();
+            let loaded = open.tracks.len();
+            let mut count = match (open.loading, open.total) {
                 (true, _) => "chargement…".to_owned(),
-                (false, Some(total)) if total as usize > open.tracks.len() => {
-                    format!("{} titres (les {} premiers sur {total})", open.tracks.len(), open.tracks.len())
-                }
-                (false, _) => format!("{} titres", open.tracks.len()),
+                (false, Some(total)) if total as usize > loaded => format!("{loaded} titres (les {loaded} premiers sur {total})"),
+                (false, _) => format!("{loaded} titres"),
             };
-            f.render_widget(Paragraph::new(Line::from(count).fg(t.muted)), head);
+            if open.filter.is_active() && !open.loading {
+                count = format!("{} / {count}", visible.len());
+            }
+            f.render_widget(Paragraph::new(filter_line(&open.filter, count, "filtrer par titre, artiste ou album")), head);
             if open.loading {
                 f.render_widget(Paragraph::new(Line::from("Chargement des titres…").fg(t.muted)), list);
+            } else if visible.is_empty() {
+                f.render_widget(Paragraph::new(Line::from("Aucun titre ne correspond au filtre.").fg(t.muted)), list);
             } else {
-                let rows = open.tracks.iter().enumerate().map(|(i, track)| {
+                let rows = visible.iter().map(|&i| (i, &open.tracks[i])).map(|(i, track)| {
                     let heart = if liked.get(&track.uri) == Some(&true) { "♥ " } else { "" };
                     Row::new::<Vec<ratatui::widgets::Cell>>(vec![
                         format!("{:>3}", i + 1).fg(t.muted).into(),
@@ -674,12 +703,15 @@ fn draw_library(f: &mut Frame, app: &mut App, area: Rect) {
                 .highlight_spacing(HighlightSpacing::Always);
                 f.render_stateful_widget(table, list, &mut open.state);
             }
+            // With a filter, whole-list actions apply to the matching tracks.
+            let (all, list_word) = if open.filter.is_active() { ("ajouter ces titres", "les jouer") } else { ("tout ajouter à la file", "jouer la liste") };
             let mut first = key("Entrée", "ajouter le titre", perms.queue_add);
-            first.extend(key("t", "tout ajouter à la file", perms.queue_manage));
-            let mut second = key("p", "jouer la liste", perms.queue_manage && perms.playback);
-            second.extend(key("s", "jouer en aléatoire", perms.queue_manage && perms.playback));
-            second.extend(key("f", "j'aime", true));
-            second.extend(key("Échap", "retour", true));
+            first.extend(key("t", all, perms.queue_manage));
+            first.extend(key("/", "filtrer", true));
+            first.extend(key("f", "j'aime", true));
+            let mut second = key("p", list_word, perms.queue_manage && perms.playback);
+            second.extend(key("s", "en aléatoire", perms.queue_manage && perms.playback));
+            second.extend(key("Échap", if open.filter.is_active() { "effacer le filtre" } else { "retour" }, true));
             f.render_widget(Paragraph::new(vec![Line::from(first), Line::from(second)]), help);
         }
     }

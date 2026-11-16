@@ -1062,7 +1062,8 @@ impl App {
 
     fn open_library_row(&mut self) -> Vec<Effect> {
         let Some(library) = self.library.as_mut() else { return vec![] };
-        let Some((source, name, total)) = library.state.selected().and_then(|i| library.row(i)) else { return vec![] };
+        let Some((source, name, total)) = library.selected_row() else { return vec![] };
+        library.filter.editing = false;
         library.open = Some(crate::library::OpenList {
             name: name.clone(),
             key: source.key().to_owned(),
@@ -1071,6 +1072,28 @@ impl App {
             ..Default::default()
         });
         vec![Effect::LoadLibraryList { source, name }]
+    }
+
+    /// Typing in a library filter; returns true when the key was used.
+    fn edit_filter(filter: &mut crate::library::Filter, state_select: &mut dyn FnMut(Option<usize>), key: KeyEvent) -> bool {
+        if !filter.editing {
+            return false;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                filter.text.clear();
+                filter.editing = false;
+            }
+            KeyCode::Enter | KeyCode::Down | KeyCode::Tab => filter.editing = false,
+            KeyCode::Backspace => {
+                filter.text.pop();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => filter.text.push(c),
+            _ => return true,
+        }
+        // The visible rows changed: back to the first one.
+        state_select(Some(0));
+        true
     }
 
     fn on_library_key(&mut self, key: KeyEvent) -> Vec<Effect> {
@@ -1084,11 +1107,26 @@ impl App {
             _ => None,
         };
         if let Some(open) = library.open.as_mut() {
+            let state = &mut open.state;
+            if Self::edit_filter(&mut open.filter, &mut |s| state.select(s), key) {
+                return vec![];
+            }
             if let Some(d) = delta {
-                open.state.select(step(open.state.selected(), open.tracks.len(), d));
+                let len = open.visible().len();
+                open.state.select(step(open.state.selected(), len, d));
                 return vec![];
             }
             return match key.code {
+                KeyCode::Char('/') => {
+                    open.filter.editing = true;
+                    vec![]
+                }
+                // Esc first clears an active filter, then goes back.
+                KeyCode::Esc if open.filter.is_active() => {
+                    open.filter.text.clear();
+                    open.state.select(Some(0));
+                    vec![]
+                }
                 KeyCode::Esc | KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
                     library.open = None;
                     vec![]
@@ -1099,24 +1137,34 @@ impl App {
                 }
                 KeyCode::Enter | KeyCode::Char('a') => self.add_library_track(),
                 KeyCode::Char('t') => self.add_library_list(AddMode::End, false),
-                KeyCode::Char('f') => {
-                    let track = open.state.selected().and_then(|i| open.tracks.get(i)).cloned();
-                    match track {
-                        Some(t) => self.toggle_like(t.uri, t.name),
-                        None => vec![],
-                    }
-                }
+                KeyCode::Char('f') => match open.selected_track().cloned() {
+                    Some(t) => self.toggle_like(t.uri, t.name),
+                    None => vec![],
+                },
                 KeyCode::Char('p') => self.add_library_list(AddMode::PlayNow, false),
                 KeyCode::Char('s') => self.add_library_list(AddMode::PlayNow, true),
                 _ => vec![],
             };
         }
+        let state = &mut library.state;
+        if Self::edit_filter(&mut library.filter, &mut |s| state.select(s), key) {
+            return vec![];
+        }
         if let Some(d) = delta {
-            let rows = library.rows();
-            library.state.select(step(library.state.selected(), rows, d));
+            let len = library.visible().len();
+            library.state.select(step(library.state.selected(), len, d));
             return vec![];
         }
         match key.code {
+            KeyCode::Char('/') => {
+                library.filter.editing = true;
+                vec![]
+            }
+            KeyCode::Esc if library.filter.is_active() => {
+                library.filter.text.clear();
+                library.state.select(Some(0));
+                vec![]
+            }
             KeyCode::Esc | KeyCode::Char('l') | KeyCode::Char('q') => {
                 self.library = None;
                 vec![]
@@ -1136,26 +1184,33 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 // A click on the selected row opens the list / adds the track.
                 if let Some(open) = library.open.as_mut() {
-                    if let Some(i) = row_index(a.library_rows, pos, open.state.offset(), open.tracks.len()) {
+                    let len = open.visible().len();
+                    if let Some(i) = row_index(a.library_rows, pos, open.state.offset(), len) {
                         if open.state.selected() == Some(i) {
                             return self.add_library_track();
                         }
                         open.state.select(Some(i));
                     }
-                } else if let Some(i) = row_index(a.library_rows, pos, library.state.offset(), library.rows()) {
-                    if library.state.selected() == Some(i) {
-                        return self.open_library_row();
+                } else {
+                    let len = library.visible().len();
+                    if let Some(i) = row_index(a.library_rows, pos, library.state.offset(), len) {
+                        if library.state.selected() == Some(i) {
+                            return self.open_library_row();
+                        }
+                        library.state.select(Some(i));
                     }
-                    library.state.select(Some(i));
                 }
             }
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                 let d = if m.kind == MouseEventKind::ScrollDown { 1 } else { -1 };
                 match library.open.as_mut() {
-                    Some(open) => open.state.select(step(open.state.selected(), open.tracks.len(), d)),
+                    Some(open) => {
+                        let len = open.visible().len();
+                        open.state.select(step(open.state.selected(), len, d));
+                    }
                     None => {
-                        let rows = library.rows();
-                        library.state.select(step(library.state.selected(), rows, d));
+                        let len = library.visible().len();
+                        library.state.select(step(library.state.selected(), len, d));
                     }
                 }
             }
@@ -1165,12 +1220,7 @@ impl App {
     }
 
     fn add_library_track(&mut self) -> Vec<Effect> {
-        let track = self
-            .library
-            .as_ref()
-            .and_then(|l| l.open.as_ref())
-            .and_then(|o| o.state.selected().and_then(|i| o.tracks.get(i)))
-            .cloned();
+        let track = self.library.as_ref().and_then(|l| l.open.as_ref()).and_then(|o| o.selected_track()).cloned();
         let Some(track) = track else { return vec![] };
         if !self.allowed(self.my_perms().queue_add, "ajouter des morceaux") {
             return vec![];
@@ -1179,7 +1229,8 @@ impl App {
         vec![Effect::Send(ClientMsg::QueueAdd { track: client::track_info(&track) })]
     }
 
-    /// Whole list: appended, or played right away (in order or shuffled).
+    /// Whole list (or the tracks matching its filter): appended, or played
+    /// right away (in order or shuffled).
     fn add_library_list(&mut self, mode: AddMode, shuffle: bool) -> Vec<Effect> {
         let perms = self.my_perms();
         if !self.allowed(perms.queue_manage, "ajouter une liste entière (ajoute les titres un par un)") {
@@ -1191,10 +1242,13 @@ impl App {
         let Some(open) = self.library.as_ref().and_then(|l| l.open.as_ref()).filter(|o| !o.loading) else {
             return vec![];
         };
-        let name = open.name.clone();
-        let mut tracks: Vec<_> = open.tracks.iter().map(client::track_info).collect();
+        let name = match open.filter.is_active() {
+            true => format!("{} (filtre « {} »)", open.name, open.filter.text.trim()),
+            false => open.name.clone(),
+        };
+        let mut tracks: Vec<_> = open.visible_tracks().into_iter().map(client::track_info).collect();
         if tracks.is_empty() {
-            self.toast(format!("« {name} » ne contient aucun morceau jouable"), Level::Warn);
+            self.toast(format!("« {name} » : aucun morceau jouable"), Level::Warn);
             return vec![];
         }
         if shuffle {
@@ -1841,7 +1895,7 @@ mod tests {
         a.on_library_list("p1".into(), Ok(vec![Track { uri: "spotify:track:c".into(), name: "Cello Suite No. 1".into(), duration_ms: 150_000, ..Default::default() }]));
         let text = draw(&mut a);
         println!("{text}");
-        for needle in ["Bibliothèque › Klassique", "1 titres (les 1 premiers sur 92)", "Cello Suite No. 1", "jouer en aléatoire"] {
+        for needle in ["Bibliothèque › Klassique", "1 titres (les 1 premiers sur 92)", "Cello Suite No. 1", "en aléatoire", "filtrer par titre, artiste ou album"] {
             assert!(text.contains(needle), "{needle} missing");
         }
     }
@@ -1909,5 +1963,49 @@ mod tests {
         assert!(text.contains("[ ♥ ]"), "like button");
         assert!(text.contains("27 %  (+/- · m muet)"), "volume");
         assert!(a.areas.like_button.width > 0 && a.areas.volume_bar.width > 5);
+    }
+
+    #[test]
+    fn library_filter_narrows_lists_and_whole_list_actions() {
+        let mut a = app();
+        a.on_key(key(KeyCode::Char('l')));
+        let pl = |id: &str, name: &str| -> PlaylistSummary {
+            serde_json::from_value(serde_json::json!({"id": id, "name": name, "items": {"total": 3}})).unwrap()
+        };
+        a.on_library(Ok(vec![pl("p1", "Soirée"), pl("p2", "Star Wars")]));
+
+        // Filter the playlists, then open the only match.
+        a.on_key(key(KeyCode::Char('/')));
+        for c in "star".chars() {
+            a.on_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(a.library.as_ref().unwrap().visible().len(), 1);
+        a.on_key(key(KeyCode::Enter)); // leave the field
+        assert_eq!(a.on_key(key(KeyCode::Enter)), [Effect::LoadLibraryList { source: crate::library::Source::Playlist { id: "p2".into() }, name: "Star Wars".into() }]);
+
+        let track = |n: &str, artist: &str| Track {
+            uri: format!("spotify:track:{n}"),
+            name: n.into(),
+            duration_ms: 1000,
+            artists: vec![spotify::models::Artist { name: artist.into() }],
+            ..Default::default()
+        };
+        a.on_library_list("p2".into(), Ok(vec![track("Duel of the Fates", "John Williams"), track("Imperial March", "John Williams"), track("Cantina", "Figrin D'an")]));
+
+        // Filter the tracks: actions apply to the matches.
+        a.on_key(key(KeyCode::Char('/')));
+        for c in "williams".chars() {
+            a.on_key(key(KeyCode::Char(c)));
+        }
+        a.on_key(key(KeyCode::Enter));
+        a.on_key(key(KeyCode::Down));
+        assert!(matches!(sent(&a.on_key(key(KeyCode::Char('a'))))[..], [ClientMsg::QueueAdd { track }] if track.name == "Imperial March"));
+        assert!(matches!(sent(&a.on_key(key(KeyCode::Char('t'))))[..], [ClientMsg::QueueAddMany { tracks, .. }] if tracks.len() == 2));
+
+        // Esc clears the filter first, then goes back to the lists.
+        a.on_key(key(KeyCode::Esc));
+        assert_eq!(a.library.as_ref().unwrap().open.as_ref().unwrap().visible().len(), 3);
+        a.on_key(key(KeyCode::Esc));
+        assert!(a.library.as_ref().unwrap().open.is_none());
     }
 }
