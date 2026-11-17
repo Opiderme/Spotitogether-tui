@@ -15,10 +15,27 @@ musique sur son propre compte Spotify.
 
 ## Installation
 
-```sh
-# Arch Linux (AUR) : depuis les sources, ou le binaire des releases GitHub
-paru -S spotitogether-git        # ou spotitogether-bin
+Sur Arch Linux, avec paru : ajoute ce dépôt de PKGBUILD à la fin de
+`~/.config/paru/paru.conf` (ou `/etc/paru.conf`)…
 
+```ini
+[spotitogether]
+Url = https://github.com/Opiderme/Spotitogether-tui
+Path = deploy/aur/spotitogether-git
+```
+
+…puis :
+
+```sh
+paru -Sy --pkgbuilds             # télécharge le dépôt (accepter les changements)
+paru -S spotitogether-git        # compile et installe
+paru -Syu --devel                # plus tard : mises à jour, dont les nouveaux commits
+```
+
+Sans paru : `git clone` du dépôt, puis `makepkg -si` dans
+`deploy/aur/spotitogether-git`.
+
+```sh
 # Ailleurs
 cargo install --locked --git https://github.com/Opiderme/Spotitogether-tui spotitogether
 ```
