@@ -57,7 +57,7 @@ Dans un salon, l'interface plein écran se pilote au clavier et à la souris :
 | `/` puis Entrée | chercher un morceau ; Entrée (ou clic) l'ajoute à la file |
 | `l` | ta bibliothèque (titres likés, playlists) : filtrer (`/`, par titre, artiste ou album), ajouter un titre (Entrée), toute la liste ou les titres filtrés (`t`), les jouer tout de suite dans l'ordre (`p`) ou en aléatoire (`s`) |
 | espace, `s`, ← → | lecture/pause du salon, morceau suivant, ±10 s |
-| `j` `k`, `J` `K`, `d` | sélection, déplacement et retrait dans la file |
+| `j` `k`, `J` `K`, `t`, `d` | sélection, déplacement, passage en tête de file et retrait |
 | `v` | visualiseur plein écran : la pochette et une animation qui réagit au son, 10 styles (`←` `→` ou `1`–`0` ; `c` pochette en blocs, ASCII couleur, ASCII pur ou vraie image ; `Échap` retour) |
 | `y` | paroles synchronisées plein écran, 8 styles d'apparition (`←` `→` ou `1`–`8` : dispersé, karaoké, chute, décodage, vague, explosion, néon, bulles ; `v` bascule vers le visualiseur) |
 | `+` `-`, `m` | ton volume, muet pour le titre en cours (toi seul ; le son revient au suivant) |

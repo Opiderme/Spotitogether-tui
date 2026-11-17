@@ -722,6 +722,7 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => select_next(&mut self.queue_state, self.queue.len()),
                 KeyCode::Char('K') => return self.move_selected(-1),
                 KeyCode::Char('J') => return self.move_selected(1),
+                KeyCode::Char('t') => return self.move_selected_to_top(),
                 KeyCode::Char('d') | KeyCode::Delete => {
                     if let Some(item) = self.queue_state.selected().and_then(|i| self.queue.get(i)) {
                         let (id, own) = (item.id, item.added_by_id == self.me);
@@ -938,6 +939,20 @@ impl App {
         }
         self.toast("Vote pour passer le morceau enregistré", Level::Info);
         vec![Effect::Send(ClientMsg::VoteSkip)]
+    }
+
+    /// Next to play: the selected track jumps to the head of the queue.
+    fn move_selected_to_top(&mut self) -> Vec<Effect> {
+        if !self.allowed(self.my_perms().queue_manage, "réordonner la file") {
+            return vec![];
+        }
+        let Some(from) = self.queue_state.selected() else { return vec![] };
+        if from == 0 {
+            return vec![];
+        }
+        let name = self.queue.get(from).map(|i| i.track.name.clone()).unwrap_or_default();
+        self.toast(format!("« {name} » passe en tête de file"), Level::Good);
+        self.move_item(from, 0)
     }
 
     fn move_selected(&mut self, delta: isize) -> Vec<Effect> {
@@ -2159,5 +2174,22 @@ mod tests {
         assert_eq!(a.library.as_ref().unwrap().open.as_ref().unwrap().visible().len(), 3);
         a.on_key(key(KeyCode::Esc));
         assert!(a.library.as_ref().unwrap().open.is_none());
+    }
+
+    #[test]
+    fn t_moves_the_selected_track_to_the_head_of_the_queue() {
+        let mut a = app();
+        // Queue: T2 T3 T4; select T4.
+        a.on_key(key(KeyCode::Char('j')));
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(sent(&a.on_key(key(KeyCode::Char('t')))), [&ClientMsg::QueueMove { id: 4, index: 0 }]);
+        assert_eq!(a.queue[0].id, 4, "reordered locally right away");
+        assert_eq!(a.queue_state.selected(), Some(0), "selection follows the track");
+        assert!(a.on_key(key(KeyCode::Char('t'))).is_empty(), "already first");
+        // Listeners cannot reorder.
+        a.me = 2;
+        a.on_key(key(KeyCode::Char('j')));
+        assert!(a.on_key(key(KeyCode::Char('t'))).is_empty());
+        assert!(a.active_toast().unwrap().0.contains("ne permet pas"));
     }
 }

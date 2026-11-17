@@ -384,7 +384,7 @@ fn draw_queue(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_spacing(HighlightSpacing::Always);
         f.render_stateful_widget(table, content, &mut app.queue_state);
     }
-    let hint_text = if focused { "j/k sélection · J/K ou glisser pour déplacer · d retirer" } else { "" };
+    let hint_text = if focused { "j/k sélection · t en tête · J/K ou glisser pour déplacer · d retirer" } else { "" };
     f.render_widget(Paragraph::new(Line::from(hint_text).fg(t.muted)), hint);
 }
 
@@ -516,7 +516,7 @@ pub fn status_line(room: &str, members: &str, me: &str, width: usize) -> String 
 fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme;
     let w = 64.min(area.width);
-    let h = 31.min(area.height);
+    let h = 32.min(area.height);
     let popup = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
     f.render_widget(Clear, popup);
     let key = |k: &str, what: &str| Line::from(vec![Span::raw(format!("  {k:<14}")).fg(t.accent), Span::raw(what.to_owned()).fg(t.text)]);
@@ -531,6 +531,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         key("← →", "reculer / avancer de 10 s"),
         key("j k  ↑ ↓", "sélection dans le panneau"),
         key("J K", "déplacer le morceau dans la file"),
+        key("t", "passer le morceau en tête de file"),
         key("d  Suppr", "retirer le morceau de la file"),
         key("r", "resynchroniser ton Spotify"),
         key("c", "pochette : ascii / blocs"),
