@@ -211,7 +211,10 @@ impl SpotifyClient {
     /// Since 2026, Development Mode only returns the items of playlists the
     /// user owns or collaborates on.
     pub async fn playlist_tracks(&self, id: &str, max: usize) -> Result<Vec<Track>> {
-        self.collect_tracks(&format!("/playlists/{id}/items"), max).await
+        match self.collect_tracks(&format!("/playlists/{id}/items"), max).await {
+            Err(Error::Api { status: 403, .. }) => Err(Error::PlaylistNotOwned),
+            other => other,
+        }
     }
 
     /// The user's liked songs, most recent first, up to `max`.
@@ -225,16 +228,14 @@ impl SpotifyClient {
         let mut tracks = Vec::new();
         let mut offset = 0;
         loop {
-            let page: Paging<PlaylistEntry> = self
+            // Entries are decoded one by one: an odd entry (local file,
+            // episode, unavailable track) is skipped instead of failing the
+            // whole list.
+            let page: Paging<Value> = self
                 .get_json(path, &[("limit", PAGE.to_string()), ("offset", offset.to_string())])
                 .await?;
             let count = page.items.len();
-            tracks.extend(
-                page.items
-                    .into_iter()
-                    .filter_map(|e| e.item)
-                    .filter(|t| t.uri.starts_with("spotify:track:") && t.duration_ms > 0),
-            );
+            tracks.extend(page.items.into_iter().filter_map(playable_track));
             offset += count;
             if count < PAGE || tracks.len() >= max || offset >= page.total as usize {
                 break;
@@ -327,6 +328,17 @@ impl SpotifyClient {
     }
 }
 
+/// The track of a playlist / liked-songs entry, if it can be played.
+fn playable_track(entry: Value) -> Option<Track> {
+    match serde_json::from_value::<PlaylistEntry>(entry) {
+        Ok(e) => e.item.filter(|t| t.uri.starts_with("spotify:track:") && t.duration_ms > 0),
+        Err(e) => {
+            tracing::warn!(%e, "skipping unreadable playlist entry");
+            None
+        }
+    }
+}
+
 fn play_body(track_uri: &str, album_uri: Option<&str>, position_ms: u64) -> Value {
     match album_uri.filter(|a| a.starts_with("spotify:album:")) {
         Some(album) => json!({ "context_uri": album, "offset": { "uri": track_uri }, "position_ms": position_ms }),
@@ -371,6 +383,16 @@ fn classify(status: u16, message: String, reason: Option<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skips_unplayable_or_unreadable_entries() {
+        let ok = json!({"item": {"uri": "spotify:track:a", "name": "A", "duration_ms": 1}});
+        assert_eq!(playable_track(ok).unwrap().uri, "spotify:track:a");
+        assert!(playable_track(json!({"item": {"uri": "spotify:local:x", "name": "L", "duration_ms": 1}})).is_none());
+        assert!(playable_track(json!({"item": {"uri": "spotify:track:b", "name": "B", "duration_ms": 0}})).is_none());
+        assert!(playable_track(json!({"item": {"uri": "spotify:track:c", "duration_ms": "oops"}})).is_none());
+        assert!(playable_track(json!({"item": null})).is_none());
+    }
 
     #[test]
     fn play_body_prefers_album_context() {

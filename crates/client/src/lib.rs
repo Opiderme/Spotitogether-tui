@@ -364,6 +364,13 @@ async fn connection(
     let mut next_ping = Instant::now();
     let mut drift_check = interval(DRIFT_CHECK_EVERY);
     drift_check.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // End of track: look at the local player a few seconds before the room
+    // track ends, then pause it right at its own end (with the playback
+    // state `seq` they were planned for).
+    let mut end_planned_for: Option<u64> = None;
+    let mut end_probe: Option<(Instant, u64)> = None;
+    let mut end_pause: Option<(Instant, u64)> = None;
+    let far = || Instant::now() + Duration::from_secs(86_400);
 
     loop {
         tokio::select! {
@@ -436,9 +443,25 @@ async fn connection(
                     let events = syncer.check(&l.spotify, &clock, playback).await;
                     let resynced = events.iter().any(|e| matches!(e, SyncEvent::Resynced { .. }));
                     events.into_iter().for_each(|e| emit(Event::Sync(e)));
-                    if resynced {
+                    if resynced || syncer.wants_recheck() {
                         drift_check.reset_at(Instant::now() + CHECK_AFTER_APPLY);
                     }
+                }
+            }
+            _ = sleep_until(end_probe.map_or_else(far, |(at, _)| at)), if end_probe.is_some() => {
+                let seq = end_probe.take().map(|(_, seq)| seq);
+                if let Some(l) = listener.as_ref().filter(|l| l.can_listen && seq == Some(playback.seq))
+                    && let Some(wait) = syncer.time_to_end(&l.spotify, playback).await
+                {
+                    end_pause = Some((Instant::now() + wait, playback.seq));
+                }
+            }
+            _ = sleep_until(end_pause.map_or_else(far, |(at, _)| at)), if end_pause.is_some() => {
+                let seq = end_pause.take().map(|(_, seq)| seq);
+                if let Some(l) = listener.as_ref().filter(|l| l.can_listen && seq == Some(playback.seq))
+                    && let Some(e) = syncer.hold_at_end(&l.spotify).await
+                {
+                    emit(Event::Sync(e));
                 }
             }
         }
@@ -451,6 +474,16 @@ async fn connection(
                 }
             }
             drift_check.reset_at(Instant::now() + CHECK_AFTER_APPLY);
+        }
+
+        // A new playback state (next track, seek, pause): plan its end.
+        if end_planned_for != Some(playback.seq) && clock.is_ready() && !pending_apply {
+            end_planned_for = Some(playback.seq);
+            end_pause = None;
+            end_probe = syncer
+                .end_probe_in(&clock, playback)
+                .filter(|_| active(listener))
+                .map(|wait| (Instant::now() + wait, playback.seq));
         }
     }
 }

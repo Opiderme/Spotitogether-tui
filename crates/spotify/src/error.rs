@@ -28,6 +28,9 @@ pub enum Error {
     #[error("autorisation Spotify insuffisante : relance `spotitogether login` pour l'accorder")]
     MissingScope,
 
+    #[error("playlist d'un autre compte : Spotify n'en donne pas les titres aux apps en mode développement (copie ses titres dans une playlist à toi)")]
+    PlaylistNotOwned,
+
     #[error("erreur API Spotify {status} : {message}")]
     Api {
         status: u16,

@@ -2,7 +2,17 @@
 //! Fields are lenient (`default`) because Spotify removes fields over time
 //! and the player may report podcast episodes instead of tracks.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// `default` only covers a missing field; Spotify also sends `null`
+/// (local files have `"uri": null` in their album, some images a null URL).
+fn nullable<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct User {
@@ -27,17 +37,27 @@ pub struct Device {
     pub supports_volume: bool,
 }
 
+fn nullable_vec<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(d)?.unwrap_or_default())
+}
+
 fn yes() -> bool {
     true
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Artist {
+    #[serde(default, deserialize_with = "nullable")]
     pub name: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Image {
+    #[serde(default, deserialize_with = "nullable")]
     pub url: String,
     #[serde(default)]
     pub width: Option<u32>,
@@ -47,11 +67,11 @@ pub struct Image {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Album {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable")]
     pub uri: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable")]
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable")]
     pub images: Vec<Image>,
 }
 
@@ -59,13 +79,15 @@ pub struct Album {
 pub struct Track {
     #[serde(default)]
     pub id: Option<String>,
+    #[serde(default, deserialize_with = "nullable")]
     pub uri: String,
+    #[serde(default, deserialize_with = "nullable")]
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable")]
     pub duration_ms: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable")]
     pub artists: Vec<Artist>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable")]
     pub album: Album,
 }
 
@@ -84,6 +106,7 @@ impl Track {
         self.album
             .images
             .iter()
+            .filter(|i| !i.url.is_empty())
             .max_by_key(|i| i.width.unwrap_or(0))
             .map(|i| i.url.as_str())
     }
@@ -116,10 +139,11 @@ pub(crate) struct DevicesResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Paging<T> {
+    #[serde(default = "Vec::new", deserialize_with = "nullable_vec", bound(deserialize = "T: Deserialize<'de>"))]
     pub items: Vec<T>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable")]
     pub total: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable")]
     pub offset: u32,
 }
 
@@ -132,9 +156,10 @@ pub struct ItemCount {
 #[derive(Debug, Clone, Deserialize)]
 pub struct PlaylistSummary {
     pub id: String,
+    #[serde(default, deserialize_with = "nullable")]
     pub name: String,
     /// `items` since February 2026, `tracks` before.
-    #[serde(default, alias = "tracks")]
+    #[serde(default, alias = "tracks", deserialize_with = "nullable")]
     pub items: ItemCount,
 }
 
@@ -183,6 +208,23 @@ mod tests {
         .unwrap();
         let uris: Vec<_> = entries.items.iter().filter_map(|e| e.item.as_ref().map(|t| t.uri.as_str())).collect();
         assert_eq!(uris, ["spotify:track:a", "spotify:track:b"]);
+    }
+
+    #[test]
+    fn tolerates_nulls_from_local_files_and_odd_images() {
+        // A local file in a playlist: album with null URI, null name, no id.
+        let local = r#"{"item":{"id":null,"uri":"spotify:local:A:B:C:180","name":"Mon mp3","duration_ms":180000,
+            "artists":[{"name":null}],"album":{"uri":null,"name":null,"images":null}}}"#;
+        let e: PlaylistEntry = serde_json::from_str(local).unwrap();
+        assert_eq!(e.item.unwrap().album.uri, "");
+        // Null image URLs are skipped when picking a cover.
+        let t: Track = serde_json::from_str(
+            r#"{"uri":"spotify:track:a","name":"A","album":{"images":[{"url":null,"width":640},{"url":"https://i/x","width":300}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(t.cover_url(), Some("https://i/x"));
+        let p: Paging<PlaylistEntry> = serde_json::from_str(r#"{"items":null,"total":null,"offset":null}"#).unwrap();
+        assert!(p.items.is_empty());
     }
 
     #[test]
