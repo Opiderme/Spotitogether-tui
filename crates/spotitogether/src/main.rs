@@ -96,6 +96,8 @@ enum Command {
     /// Commandes Spotify directes, pour tester ton installation
     #[command(subcommand)]
     Spotify(spotify_cmd::SpotifyCmd),
+    /// Prototype du jeu de voiture : rendu 3D dans le terminal et mesures
+    Drive,
 }
 
 #[tokio::main]
@@ -128,6 +130,7 @@ async fn run(cli: Cli) -> Result<()> {
             room_cmd::join(room_cmd::JoinArgs { invite, code, name, host_token, guest, spectator, plain }).await
         }
         Command::Spotify(cmd) => spotify_cmd::run(cmd).await,
+        Command::Drive => tokio::task::spawn_blocking(game::demo::run).await?,
     }
 }
 

@@ -16,3 +16,7 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 opt-level = 2
 debug = false
+
+# The software renderer is too slow unoptimised to judge the frame rate.
+[profile.dev.package.game]
+opt-level = 3
